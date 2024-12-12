@@ -148,16 +148,6 @@ static bool get_cursor_position(
     return pointer_is_on_screen;
 }
 
-/*
-static void move_window_to_cursor(Display *d, Window w, int width, int height) {
-    int cursor_x;
-    int cursor_y;
-    if (get_cursor_position(d, w, &cursor_x, &cursor_y)) {
-        XMoveWindow(d, w, cursor_x - width / 2, cursor_y - height / 2);
-    }
-}
-*/
-
 static bool has_extension(Display *d, const char *name) {
     int dummy_int;
     bool has_extension = XQueryExtension(d, name, &dummy_int, &dummy_int, &dummy_int);
@@ -175,20 +165,6 @@ static void init_extension(Display *d, const char *name) {
     }
 }
 
-static XImage *allocate_shm_image(
-        Display *d, XShmSegmentInfo *info, Visual *v, int depth, int width, int height)
-{
-    XImage *img = XShmCreateImage(
-            d, v, depth, XShmPixmapFormat(d), NULL, info,
-            width, height);
-    info->shmid = shmget(IPC_PRIVATE,
-            img->bytes_per_line * img->height,
-            IPC_CREAT|0777);
-    info->shmaddr = img->data = shmat(info->shmid, 0, 0);
-    info->readOnly = false;
-    XShmAttach(d, info);
-    return img;
-}
 
 int main() {
     // An int to pass as a fishing pointer to functions which will fail if
@@ -235,16 +211,17 @@ int main() {
         init_extension(d, required_extensions[i]);
     }
 
+    GC gc = DefaultGC(d, 0);
+
     // Create the window
     int attr_mask = CWOverrideRedirect | CWBackPixel;
     XSetWindowAttributes WindowAttributes = {
         .override_redirect = true,
         .background_pixel = 0x000000
     };
-    int width = root_attr.width;
-    int height = root_attr.height;
+
     Window w = XCreateWindow(
-            d, root,  0, 0, width, height,
+            d, root,  0, 0, root_attr.width, root_attr.height,
             0, CopyFromParent, CopyFromParent, CopyFromParent,
             attr_mask, &WindowAttributes);
     //move_window_to_cursor(d, w, width, height);
@@ -337,23 +314,6 @@ int main() {
     struct pollfd *x_pollfd = &pollfds[0];
     struct pollfd *li_pollfd = &pollfds[1];
 
-    // Setup getting events from MIT-SHM
-    int shm_event_base = XShmGetEventBase(d);
-    int shm_completion_event = shm_event_base + ShmCompletion;
-
-    // Setup SHM images
-    Visual *v = DefaultVisual(d, 0);
-    GC gc = DefaultGC(d, 0);
-
-    // Image which gets copied to the main window
-    XShmSegmentInfo info;
-    XImage *img = allocate_shm_image(d, &info, v, DefaultDepth(d, 0), root_attr.width, root_attr.height);
-
-    // Image into which we copy windows, needs to be 32 bit in order to do
-    // alpha blending
-    XShmSegmentInfo back_info;
-    XImage *back_img = allocate_shm_image(d, &back_info, v, 32, root_attr.width, root_attr.height);
-
     // XRender setup
 
     // Format for windows with 32-bit colour (alpha + RGB)
@@ -368,30 +328,42 @@ int main() {
     XRenderPictFormat *format_1 = XRenderFindStandardFormat(d, PictStandardA1);
     if (format_1 == NULL) exit_error("Finding XRender format failed for PictStandardA1");
 
+    // `dest_pixmap` will hold the copy of the screen contents
     Pixmap dest_pixmap = XCreatePixmap(d, root, root_attr.width, root_attr.height, root_attr.depth);
     Picture dest_pic = XRenderCreatePicture(d, dest_pixmap, format_24, 0, NULL);
-    if (dest_pic == NULL) exit_error("Creating destination XRender picture failed");
+    if (dest_pic == None) exit_error("Creating destination XRender picture failed");
+
+    // `final_pixmap` will hold the final image shown to the user
+    Pixmap final_pixmap = XCreatePixmap(d, root, root_attr.width, root_attr.height, root_attr.depth);
+    Picture final_pic = XRenderCreatePicture(d, final_pixmap, format_24, 0, NULL);
+    if (final_pic == None) exit_error("Creating final XRender picture failed");
 
     Pixmap root_pixmap = get_root_pixmap(d, root);
 
     // Show the window
     XMapWindow(d, w);
-    XFlush(d);
+    // Put the screen contents on the window initially
+    XCopyArea(d, root, w, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
+    XSync(d, true);
+
+    int cursor_x;
+    int cursor_y;
+    int width = DEFAULT_WIDTH;
+    int height = DEFAULT_HEIGHT;
 
     bool keep_running = true;
     while (keep_running) {
         poll(pollfds, num_fds, -1);
 
-        XRaiseWindow(d, w);
-        //XFlush(d);
-        //XFlush(d);
-        //XSync(d, false);
+        bool has_damage = false;
+        bool has_input = false;
 
         // If there are new events from libinput
         if (li_pollfd->revents & POLLIN) {
             libinput_dispatch(li);
             struct libinput_event *li_ev;
             while ((li_ev = libinput_get_event(li)) != NULL) {
+                has_input = true;
                 switch (libinput_event_get_type(li_ev)) {
                     case LIBINPUT_EVENT_KEYBOARD_KEY:
                         struct libinput_event_keyboard *li_ev_key =
@@ -412,183 +384,121 @@ int main() {
             }
         }
 
-        bool no_damage = true;
-        // TODO: manage these better
-        int top_left_x = width;
-        int top_left_y = height;
-        int bottom_right_x = 0;
-        int bottom_right_y = 0;
         // If there are new events from Xlib
+        if (has_input) {
+            XSync(d, true);
+        }
         if (x_pollfd->revents & POLLIN) {
             while (XPending(d) > 0) {
-                XRaiseWindow(d, w);
                 XEvent x_ev;
                 XNextEvent(d, &x_ev);
                 if (x_ev.type == damage_notify_event) {
-                    no_damage = false;
-                    XDamageNotifyEvent *d_ev = (XDamageNotifyEvent *) &x_ev;
-                    // area, geometry
-                    top_left_x = int_min(top_left_x, d_ev->area.x);
-                    top_left_y = int_min(top_left_y, d_ev->area.y);
-                    bottom_right_x = int_max(bottom_right_x, d_ev->area.x + d_ev->area.width);
-                    bottom_right_y = int_max(bottom_right_y, d_ev->area.y + d_ev->area.height);
-                    XDamageSubtract(d, damage, None, None);
+                    has_damage = true;
                 }
             }
-        }
-        //XDamageSubtract(d, damage, None, None);
-        //XSync(d, false);
-        //XDamageSubtract(d, damage, None, None);
-        XFlush(d);
-
-        // Redraw the window contents
-        if (!no_damage) {
-            /*
-            while (XPending(d) > 0) {
-                XEvent x_ev;
-                XNextEvent(d, &x_ev);
-            }
-            */
-
-        XWindowAttributes dest_attr;
-        XGetWindowAttributes(d, w, &dest_attr);
-
-        // Clear img
-        /*
-        for (int y = top_left_y; y < bottom_right_y; y++) {
-            for (int x = top_left_x; x < bottom_right_x; x++) {
-                XPutPixel(img, x, y, 0);
-            }
-        }
-        */
-        // Copy wallpaper
-        if (root_pixmap != None) {
-            XCopyArea(d, root_pixmap, dest_pixmap, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
-        }
-
-        Window dummy_window;
-        unsigned int num_windows;
-        Window *windows;
-        XQueryTree(d, root, &dummy_window, &dummy_window, &windows, &num_windows);
-        for (unsigned int i = 0; i < num_windows; i++) {
-            Window src_w = windows[i];
-            if (src_w == w) continue;
-
-            XWindowAttributes src_attr;
-            Status err = XGetWindowAttributes(d, src_w, &src_attr);
-            if (err == 0 || src_attr.map_state != IsViewable) continue;
-
-            int src_x;
-            int src_y;
-            int dest_x;
-            int dest_y;
-            int intersection_width;
-            int intersection_height;
-            bool intersection_is_valid = get_intersection(
-                    dest_attr.x, dest_attr.y, dest_attr.width, dest_attr.height,
-                    src_attr.x, src_attr.y, src_attr.width, src_attr.height,
-                    &src_x, &src_y, &dest_x, &dest_y,
-                    &intersection_width, &intersection_height);
-            if (intersection_is_valid) {
-                Picture src_pic = XRenderCreatePicture(d, src_w, src_attr.depth == 24 ? format_24 : format_32, 0, NULL);
-                if (src_pic == NULL) exit_error("Creating source XRender picture failed");
-
-                Pixmap mask = XCreatePixmap(d, root, src_attr.width, src_attr.height, 1);
-                GC mask_gc = XCreateGC(d, mask, 0, NULL);
-                Picture mask_pic = XRenderCreatePicture(d, mask, format_1, 0, NULL);
-                if (mask_pic == NULL) exit_error("Creating mask XRender picture failed");
-                XSetForeground(d, mask_gc, BlackPixel(d, DefaultScreen(d)));
-                XFillRectangle(d, mask, mask_gc, 0, 0, src_attr.width, src_attr.height);
-                XSetForeground(d, mask_gc, WhitePixel(d, DefaultScreen(d)));
-                int num_holes;
-                XRectangle *holes = XShapeGetRectangles(d, src_w, ShapeBounding, &num_holes, &dummy_int);
-                for (int i = 0; i < num_holes; i++) {
-                    XRectangle hole = holes[i];
-                    XFillRectangle(d, mask, mask_gc, hole.x, hole.y, hole.width, hole.height);
-                }
-                XFree(holes);
-                XFreeGC(d, mask_gc);
-                /*
-                // Fudging image dimensions because shm images can't be
-                // (nicely) resized
-                //back_img->width = src_attr.width;
-                back_img->width = intersection_width;
-                //back_img->height = src_attr.height;
-                back_img->height = intersection_height;
-                unsigned char bytes_per_pixel = (back_img->bits_per_pixel + 7) / 8;
-                back_img->bytes_per_line = bytes_per_pixel * back_img->width;
-                XShmGetImage(d, src_w, back_img, src_x, src_y, AllPlanes);
-                for (int y = 0; y < intersection_height; y++) {
-                    for (int x = 0; x < intersection_width; x++) {
-                        unsigned long pixel = XGetPixel(back_img, x, y);
-                        unsigned char alpha = (pixel >> (bytes_per_pixel - 1) * 8) & 0xff;
-                        if (alpha > 100) {
-                            XPutPixel(img, dest_x + x, dest_y + y, pixel);
-                            //XPutPixel(img, dest_x + x, dest_y + y, src_w / 10 + pixel);
-                        }
-                    }
-                }
-                */
-                int op = src_attr.depth == 32 ? PictOpOver : PictOpSrc;
-                XRenderComposite(d, op, src_pic, mask_pic, dest_pic, src_x, src_y, src_x, src_y, dest_x, dest_y, intersection_width, intersection_height);
-
-                XRenderFreePicture(d, src_pic);
-                XRenderFreePicture(d, mask_pic);
-                XFreePixmap(d, mask);
-            }
-        }
-        XFree(windows);
-        //XRenderComposite(d, PictOpSrc, dest_pic, None, dest_pic, 200, 200, 0, 0, 0, 0, 200, 200);
-
-        // paint the damaged region
-        /*
-        for (int y = top_left_y; y < bottom_right_y; y++) {
-            for (int x = top_left_x; x < bottom_right_x; x++) {
-                XPutPixel(img, x, y, XGetPixel(img, x, y) / 2);
-            }
-        }
-        */
-
-        // TODO: replace with proper compositing with zoom effect
-        XCopyArea(d, dest_pixmap, w, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
-
-        //XSync(d, true);
-        //TODO: consider tracking prev damage and updating that as well as
-        //current damage!!!
-        //XShmPutImage(d, w, gc, img, 0, 0, 0, 0, width, height, true);
-        //XShmPutImage(d, w, gc, img, 0, 0, 0, 0, width, height, false);
-        //XFlush(d);
-        //XShmPutImage(d, w, gc, img, top_left_x, top_left_y, top_left_x, top_left_y, bottom_right_x - top_left_x, bottom_right_y - top_left_y, true);
-        //XShmPutImage(d, w, gc, img, top_left_x, top_left_y, top_left_x, top_left_y, bottom_right_x - top_left_x, bottom_right_y - top_left_y, false);
-        //XSync(d, false);
-        //XFlush(d);
-        // Wait until the image is set before continuing
-        // Wait until damage event
-        /*
-        for (;;) {
-            XEvent x_ev;
-            XNextEvent(d, &x_ev);
-            if (x_ev.type == damage_notify_event) break;
         }
         XDamageSubtract(d, damage, None, None);
-        */
-        // TODO: use XIFEVENT instead!!!!
-        /*
-        for (;;) {
-            XEvent x_ev;
-            XNextEvent(d, &x_ev);
-            if (x_ev.type == shm_completion_event) {
-                break;
-            } else {
-                XPutBackEvent(d, &x_ev);
+
+        // Redraw the window contents
+        if (has_damage || has_input) {
+            XWindowAttributes dest_attr;
+            XGetWindowAttributes(d, w, &dest_attr);
+
+            // Copy wallpaper
+            if (root_pixmap != None) {
+                XCopyArea(d, root_pixmap, dest_pixmap, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
             }
+
+            Window dummy_window;
+            unsigned int num_windows;
+            Window *windows;
+            XQueryTree(d, root, &dummy_window, &dummy_window, &windows, &num_windows);
+            for (unsigned int i = 0; i < num_windows; i++) {
+                Window src_w = windows[i];
+                if (src_w == w) continue;
+
+                XWindowAttributes src_attr;
+                Status err = XGetWindowAttributes(d, src_w, &src_attr);
+                if (err == 0 || src_attr.map_state != IsViewable) continue;
+
+                int src_x;
+                int src_y;
+                int dest_x;
+                int dest_y;
+                int intersection_width;
+                int intersection_height;
+                bool intersection_is_valid = get_intersection(
+                        dest_attr.x, dest_attr.y, dest_attr.width, dest_attr.height,
+                        src_attr.x, src_attr.y, src_attr.width, src_attr.height,
+                        &src_x, &src_y, &dest_x, &dest_y,
+                        &intersection_width, &intersection_height);
+                if (intersection_is_valid) {
+                    Picture src_pic = XRenderCreatePicture(d, src_w, src_attr.depth == 24 ? format_24 : format_32, 0, NULL);
+                    if (src_pic == None) exit_error("Creating source XRender picture failed");
+
+                    int num_holes;
+                    XRectangle *holes = XShapeGetRectangles(d, src_w, ShapeBounding, &num_holes, &dummy_int);
+                    Pixmap mask = XCreatePixmap(d, root, src_attr.width, src_attr.height, 1);
+                    GC mask_gc = XCreateGC(d, mask, 0, NULL);
+                    Picture mask_pic = XRenderCreatePicture(d, mask, format_1, 0, NULL);
+                    if (mask_pic == None) exit_error("Creating mask XRender picture failed");
+                    XSetForeground(d, mask_gc, BlackPixel(d, DefaultScreen(d)));
+                    XFillRectangle(d, mask, mask_gc, 0, 0, src_attr.width, src_attr.height);
+                    XSetForeground(d, mask_gc, WhitePixel(d, DefaultScreen(d)));
+                    for (int i = 0; i < num_holes; i++) {
+                        XRectangle hole = holes[i];
+                        XFillRectangle(d, mask, mask_gc, hole.x, hole.y, hole.width, hole.height);
+                    }
+                    XFree(holes);
+                    XFreeGC(d, mask_gc);
+
+                    int op = src_attr.depth == 32 ? PictOpOver : PictOpSrc;
+                    XRenderComposite(d, op, src_pic, mask_pic, dest_pic, src_x, src_y, src_x, src_y, dest_x, dest_y, intersection_width, intersection_height);
+
+                    XRenderFreePicture(d, src_pic);
+                    XRenderFreePicture(d, mask_pic);
+                    XFreePixmap(d, mask);
+                }
+            }
+            XFree(windows);
+
+            XCopyArea(d, dest_pixmap, final_pixmap, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
+
+            get_cursor_position(d, root, &cursor_x, &cursor_y);
+            double scale = 2.0;
+            XFixed scale_f = XDoubleToFixed(1.0 / scale);
+            XFixed one_f = XDoubleToFixed(1.0);
+            XFixed zero_f = XDoubleToFixed(0.0);
+            XTransform identity = {{
+                {one_f, zero_f, zero_f},
+                {zero_f, one_f, zero_f},
+                {zero_f, zero_f, one_f}
+            }};
+            XTransform scale_transform = {{
+                {scale_f, zero_f, zero_f},
+                {zero_f, scale_f, zero_f},
+                {zero_f, zero_f, one_f}
+            }};
+
+            XRenderSetPictureTransform(d, dest_pic, &scale_transform);
+
+            int scaled_cursor_x = cursor_x * scale;
+            int scaled_cursor_y = cursor_y * scale;
+            int half_width = width / 2;
+            int half_height = height / 2;
+            XRenderComposite(d, PictOpSrc, dest_pic, None, final_pic, scaled_cursor_x - half_width, scaled_cursor_y - half_height, 0, 0, cursor_x - half_width, cursor_y - half_height, width, height);
+
+            XRenderSetPictureTransform(d, dest_pic, &identity);
+
+            XCopyArea(d, final_pixmap, w, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
+
+            // Consume one damage event to prevent infinite loop
+            XEvent x_ev;
+            wait_for_event(d, &x_ev, damage_notify_event);
         }
-        */
-        XEvent x_ev;
-        //wait_for_event(d, &x_ev, shm_completion_event);
-        // Consume one damage event to prevent infinite loop
-        wait_for_event(d, &x_ev, damage_notify_event);
-        }
+
+        XRaiseWindow(d, w);
+        XSync(d, false);
     }
 
     XDamageDestroy(d, damage);
