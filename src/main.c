@@ -1,6 +1,5 @@
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
-#include <X11/extensions/XShm.h>
 #include <X11/extensions/Xdamage.h>
 #include <X11/extensions/composite.h>
 #include <X11/extensions/Xrender.h>
@@ -17,15 +16,15 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <unistd.h>
-#include <sys/shm.h>
+#include <time.h>
 
 
 #ifndef DEFAULT_WIDTH
-#define DEFAULT_WIDTH 300
+#define DEFAULT_WIDTH 400
 #endif
 
 #ifndef DEFAULT_HEIGHT
-#define DEFAULT_HEIGHT 300
+#define DEFAULT_HEIGHT 400
 #endif
 
 #ifndef WINDOW_TITLE
@@ -62,6 +61,10 @@ void exit_error(const char *msg) {
     exit(1);
 }
 
+void exit_error_if(bool cond, const char *msg) {
+    if (cond) exit_error(msg);
+}
+
 // Try to get an atom with the given name with XInternAtom and exit the program
 // if it doesn't exist (if XInternAtom returns `None`)
 Atom get_atom_not_none(Display *d, char *name) {
@@ -73,7 +76,7 @@ Atom get_atom_not_none(Display *d, char *name) {
     return atom;
 }
 
-Pixmap get_root_pixmap(Display *d, Window root) {
+Pixmap get_root_background_pixmap(Display *d, Window root) {
     Atom root_pixmap = get_atom_not_none(d, "_XROOTPMAP_ID");
 
     Atom actual_type;
@@ -86,9 +89,13 @@ Pixmap get_root_pixmap(Display *d, Window root) {
             d, root, root_pixmap, 0, 1, false, XA_PIXMAP, &actual_type,
             &actual_format, &nitems, &bytes_after, (unsigned char **) &prop);
 
-    if (status != Success) exit_error("Getting root pixmap failed");
-
-    return *prop;
+    if (status == Success) {
+        Pixmap root_background_pixmap = *prop;
+        XFree(prop);
+        return root_background_pixmap;
+    } else {
+        return None;
+    }
 }
 
 static Bool wait_for_event_predicate(Display *d, XEvent *x_ev, XPointer arg) {
@@ -125,7 +132,7 @@ static bool get_intersection(
 
     *src_x = top_left_x - src_window_x;
     *src_y = top_left_y - src_window_y;
-    
+
     *dest_x = top_left_x - dest_window_x;
     *dest_y = top_left_y - dest_window_y;
 
@@ -165,6 +172,114 @@ static void init_extension(Display *d, const char *name) {
     }
 }
 
+void draw(
+        int width, int height, double scale, int cursor_x, int cursor_y,
+        Pixmap root_background_pixmap, Pixmap dest_pixmap, Pixmap final_pixmap,
+        Picture dest_pic, Picture final_pic,
+        XWindowAttributes root_attr, XWindowAttributes dest_attr,
+        Window root, Window w, Display *d, GC gc,
+        XRenderPictFormat *format_32, XRenderPictFormat *format_24, XRenderPictFormat *format_1)
+{
+    int dummy_int;
+
+    // Copy wallpaper
+    if (root_background_pixmap != None) {
+        XCopyArea(d, root_background_pixmap, dest_pixmap, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
+    } else {
+        XSetForeground(d, gc, BlackPixel(d, DefaultScreen(d)));
+        XFillRectangle(d, dest_pixmap, gc, 0, 0, root_attr.width, root_attr.height);
+    }
+
+    Window dummy_window;
+    unsigned int num_windows;
+    Window *windows;
+    XQueryTree(d, root, &dummy_window, &dummy_window, &windows, &num_windows);
+    for (unsigned int i = 0; i < num_windows; i++) {
+        Window src_w = windows[i];
+        if (src_w == w) continue;
+
+        XWindowAttributes src_attr;
+        Status err = XGetWindowAttributes(d, src_w, &src_attr);
+        if (err == 0 || src_attr.map_state != IsViewable) continue;
+
+        int src_x;
+        int src_y;
+        int dest_x;
+        int dest_y;
+        int intersection_width;
+        int intersection_height;
+        bool intersection_is_valid = get_intersection(
+                dest_attr.x, dest_attr.y, dest_attr.width, dest_attr.height,
+                src_attr.x, src_attr.y, src_attr.width, src_attr.height,
+                &src_x, &src_y, &dest_x, &dest_y,
+                &intersection_width, &intersection_height);
+        if (intersection_is_valid) {
+            Picture src_pic = XRenderCreatePicture(d, src_w, src_attr.depth == 24 ? format_24 : format_32, 0, NULL);
+            //if (src_pic == None) exit_error("Creating source XRender picture failed");
+
+            int num_rects;
+            XRectangle *rects = XShapeGetRectangles(d, src_w, ShapeBounding, &num_rects, &dummy_int);
+            Pixmap mask = XCreatePixmap(d, root, src_attr.width, src_attr.height, 1);
+            GC mask_gc = XCreateGC(d, mask, 0, NULL);
+            Picture mask_pic = XRenderCreatePicture(d, mask, format_1, 0, NULL);
+            //if (mask_pic == None) exit_error("Creating mask XRender picture failed");
+            XSetForeground(d, mask_gc, BlackPixel(d, DefaultScreen(d)));
+            XFillRectangle(d, mask, mask_gc, 0, 0, src_attr.width, src_attr.height);
+            XSetForeground(d, mask_gc, WhitePixel(d, DefaultScreen(d)));
+            for (int i = 0; i < num_rects; i++) {
+                XRectangle rect = rects[i];
+                XFillRectangle(d, mask, mask_gc, rect.x, rect.y, rect.width, rect.height);
+            }
+            XFree(rects);
+            XFreeGC(d, mask_gc);
+
+            int op = src_attr.depth == 32 ? PictOpOver : PictOpSrc;
+            XRenderComposite(d, op, src_pic, mask_pic, dest_pic, src_x, src_y, src_x, src_y, dest_x, dest_y, intersection_width, intersection_height);
+
+            XRenderFreePicture(d, src_pic);
+            XRenderFreePicture(d, mask_pic);
+            XFreePixmap(d, mask);
+        }
+    }
+    XFree(windows);
+
+    XCopyArea(d, dest_pixmap, final_pixmap, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
+    //XRenderComposite(d, PictOpSrc, dest_pic, None, final_pic, 0, 0, 0, 0, 0, 0, root_attr.width, root_attr.height);
+
+    XFixed scale_f = XDoubleToFixed(1.0 / scale);
+    XFixed one_f = XDoubleToFixed(1.0);
+    XFixed zero_f = XDoubleToFixed(0.0);
+    /*
+    XTransform identity = {{
+       {one_f, zero_f, zero_f},
+       {zero_f, one_f, zero_f},
+       {zero_f, zero_f, one_f}
+       }};
+    */
+    XTransform scale_transform = {{
+        {scale_f, zero_f, zero_f},
+            {zero_f, scale_f, zero_f},
+            {zero_f, zero_f, one_f}
+    }};
+
+    XRenderSetPictureTransform(d, dest_pic, &scale_transform);
+
+    get_cursor_position(d, root, &cursor_x, &cursor_y);
+    int scaled_cursor_x = cursor_x * scale;
+    int scaled_cursor_y = cursor_y * scale;
+    int half_width = width / 2;
+    int half_height = height / 2;
+
+    XSetForeground(d, gc, BlackPixel(d, DefaultScreen(d)));
+    XFillRectangle(d, final_pixmap, gc, cursor_x - half_width - 2, cursor_y - half_height - 2, width + 4, height + 4);
+
+    XRenderComposite(d, PictOpSrc, dest_pic, None, final_pic, scaled_cursor_x - half_width, scaled_cursor_y - half_height, 0, 0, cursor_x - half_width, cursor_y - half_height, width, height);
+
+    //XRenderSetPictureTransform(d, dest_pic, &identity);
+
+    XCopyArea(d, final_pixmap, w, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
+
+}
 
 int main() {
     // An int to pass as a fishing pointer to functions which will fail if
@@ -193,7 +308,6 @@ int main() {
         DAMAGE_NAME,
         SHAPENAME,
         XFIXES_NAME,
-        SHMNAME,
         SHAPENAME,
         COMPOSITE_NAME,
         RENDER_NAME
@@ -217,14 +331,12 @@ int main() {
     int attr_mask = CWOverrideRedirect | CWBackPixel;
     XSetWindowAttributes WindowAttributes = {
         .override_redirect = true,
-        .background_pixel = 0x000000
     };
 
     Window w = XCreateWindow(
             d, root,  0, 0, root_attr.width, root_attr.height,
             0, CopyFromParent, CopyFromParent, CopyFromParent,
             attr_mask, &WindowAttributes);
-    //move_window_to_cursor(d, w, width, height);
 
     Atom atom = get_atom_not_none(d, "ATOM");
     Atom string = get_atom_not_none(d, "STRING");
@@ -291,7 +403,7 @@ int main() {
     // We want to know about substructure events because these tell us when new
     // windows are created, raised, fullscreened, etc. and let us keep our
     // magnifier window on top when this happens.
-    XSelectInput(d, root, SubstructureNotifyMask);
+    XSelectInput(d, root, SubstructureNotifyMask | StructureNotifyMask | PropertyChangeMask);
     int damage_event_base;
     XDamageQueryExtension(d, &damage_event_base, &dummy_int);
     int damage_notify_event = damage_event_base + XDamageNotify;
@@ -338,45 +450,137 @@ int main() {
     Picture final_pic = XRenderCreatePicture(d, final_pixmap, format_24, 0, NULL);
     if (final_pic == None) exit_error("Creating final XRender picture failed");
 
-    Pixmap root_pixmap = get_root_pixmap(d, root);
+    Pixmap root_background_pixmap = get_root_background_pixmap(d, root);
 
     // Show the window
     XMapWindow(d, w);
     // Put the screen contents on the window initially
     XCopyArea(d, root, w, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
-    XSync(d, true);
 
-    int cursor_x;
-    int cursor_y;
+    XWindowAttributes dest_attr;
+    XGetWindowAttributes(d, w, &dest_attr);
+
+    int cursor_x = 0;
+    int cursor_y = 0;
+    get_cursor_position(d, root, &cursor_x, &cursor_y);
     int width = DEFAULT_WIDTH;
     int height = DEFAULT_HEIGHT;
+    double scale = 2.0;
+    int rate = 60;
+
+    uint32_t modifiers[] = {
+        KEY_LEFTMETA,
+        KEY_LEFTCTRL
+    };
+    const int num_modifiers = sizeof(modifiers) / sizeof(modifiers[0]);
+    int modifiers_held = 0;
+
+    uint32_t quit = KEY_ESC;
+
+    uint32_t grow_width = KEY_RIGHT;
+    uint32_t shrink_width = KEY_LEFT;
+    uint32_t grow_height = KEY_DOWN;
+    uint32_t shrink_height = KEY_UP;
+    int width_step = 50;
+    int height_step = 50;
+
+    draw(
+            width, height, scale, cursor_x, cursor_y,
+            root_background_pixmap, dest_pixmap, final_pixmap,
+            dest_pic, final_pic, root_attr, dest_attr, root, w, d, gc,
+            format_32, format_24, format_1);
+    XFlush(d);
 
     bool keep_running = true;
+    bool input_grabbed = false;
     while (keep_running) {
         poll(pollfds, num_fds, -1);
+
+        struct timespec prev_time;
+        struct timespec time;
+
+        clock_gettime(CLOCK_MONOTONIC_RAW, &prev_time);
 
         bool has_damage = false;
         bool has_input = false;
 
         // If there are new events from libinput
         if (li_pollfd->revents & POLLIN) {
+            has_input = true;
             libinput_dispatch(li);
             struct libinput_event *li_ev;
             while ((li_ev = libinput_get_event(li)) != NULL) {
-                has_input = true;
                 switch (libinput_event_get_type(li_ev)) {
                     case LIBINPUT_EVENT_KEYBOARD_KEY:
                         struct libinput_event_keyboard *li_ev_key =
                             libinput_event_get_keyboard_event(li_ev);
                         uint32_t keycode =
                             libinput_event_keyboard_get_key(li_ev_key);
-                        if (keycode == KEY_ESC) {
-                            keep_running = false;
+                        enum libinput_key_state state =
+                            libinput_event_keyboard_get_key_state(li_ev_key);
+                        int modifier = -1;
+                        for (int i = 0; i < num_modifiers; i++) {
+                            if (keycode == modifiers[i]) {
+                                modifier = i;
+                                break;
+                            }
+                        }
+                        switch (state) {
+                            case LIBINPUT_KEY_STATE_PRESSED:
+                                if (modifier != -1) {
+                                    modifiers_held++;
+                                    bool all_modifiers_held = modifiers_held == num_modifiers;
+                                    if (all_modifiers_held) {
+                                        input_grabbed =
+                                            XGrabPointer(d, w, true, NoEventMask, GrabModeAsync, GrabModeAsync, None, None, CurrentTime) == GrabSuccess
+                                            && XGrabKeyboard(d, w, true, GrabModeAsync, GrabModeAsync, CurrentTime) == GrabSuccess;
+                                        if (!input_grabbed) {
+                                            XUngrabPointer(d, CurrentTime);
+                                            XUngrabKeyboard(d, CurrentTime);
+                                        }
+                                    }
+                                }
+                                break;
+                            case LIBINPUT_KEY_STATE_RELEASED:
+                                if (modifier != -1) {
+                                    modifiers_held = 0;
+                                    XUngrabPointer(d, CurrentTime);
+                                    XUngrabKeyboard(d, CurrentTime);
+                                    input_grabbed = false;
+                                } else if (keycode == quit) {
+                                    keep_running = false;
+                                }
+                                if (input_grabbed) {
+                                    if (keycode == grow_width) {
+                                        width = int_min(width + width_step, root_attr.width);
+                                    } else if (keycode == shrink_width) {
+                                        width = int_max(width - width_step, 1);
+                                    } else if (keycode == grow_height) {
+                                        height = int_min(height + height_step, root_attr.height);
+                                    } else if (keycode == shrink_height) {
+                                        height = int_max(height - height_step, 1);
+                                    }
+                                }
+                                break;
                         }
                         break;
+                    case LIBINPUT_EVENT_POINTER_MOTION:
+                        has_input = true;
+                        break;
                     case LIBINPUT_EVENT_POINTER_AXIS:
-                        struct libinput_event_pointer *li_ev_axis =
-                            libinput_event_get_pointer_event(li_ev);
+                        has_input = true;
+                        bool all_modifiers_held = modifiers_held == num_modifiers;
+                        if (all_modifiers_held) {
+                            struct libinput_event_pointer *li_ev_axis =
+                                libinput_event_get_pointer_event(li_ev);
+                            double scroll = libinput_event_pointer_get_axis_value(li_ev_axis, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
+                            scale -= scroll / 20.0;
+                            if (scale < 1.0) {
+                                scale = 1.0;
+                            } else if (scale > 10.0) {
+                                scale = 10.0;
+                            }
+                        }
                         break;
                     default:
                 }
@@ -385,126 +589,91 @@ int main() {
         }
 
         // If there are new events from Xlib
-        if (has_input) {
-            XSync(d, true);
-        }
+        //if (!has_input && x_pollfd->revents & POLLIN) {
         if (x_pollfd->revents & POLLIN) {
-            while (XPending(d) > 0) {
+            bool more = false;
+            while (XPending(d) > 0 || more) {
                 XEvent x_ev;
                 XNextEvent(d, &x_ev);
+                //printf("%u\n", x_ev.type);
                 if (x_ev.type == damage_notify_event) {
+                    //printf("%u\n", x_ev.type);
                     has_damage = true;
-                }
+                    more = ((XDamageNotifyEvent *) &x_ev)->more;
+                    //XSync(d, true);
+                }/* if (x_ev.type == NoExpose) {
+                    //has_damage = true;
+                }*/
             }
+            XDamageSubtract(d, damage, None, None);
+            XRaiseWindow(d, w);
         }
-        XDamageSubtract(d, damage, None, None);
+        //XSync(d, true);
 
-        // Redraw the window contents
-        if (has_damage || has_input) {
-            XWindowAttributes dest_attr;
-            XGetWindowAttributes(d, w, &dest_attr);
+        /*
+        if (has_damage) {
+            XEvent x_ev;
+            wait_for_event(d, &x_ev, NoExpose);
+        }
+        */
 
-            // Copy wallpaper
-            if (root_pixmap != None) {
-                XCopyArea(d, root_pixmap, dest_pixmap, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
-            }
-
-            Window dummy_window;
-            unsigned int num_windows;
-            Window *windows;
-            XQueryTree(d, root, &dummy_window, &dummy_window, &windows, &num_windows);
-            for (unsigned int i = 0; i < num_windows; i++) {
-                Window src_w = windows[i];
-                if (src_w == w) continue;
-
-                XWindowAttributes src_attr;
-                Status err = XGetWindowAttributes(d, src_w, &src_attr);
-                if (err == 0 || src_attr.map_state != IsViewable) continue;
-
-                int src_x;
-                int src_y;
-                int dest_x;
-                int dest_y;
-                int intersection_width;
-                int intersection_height;
-                bool intersection_is_valid = get_intersection(
-                        dest_attr.x, dest_attr.y, dest_attr.width, dest_attr.height,
-                        src_attr.x, src_attr.y, src_attr.width, src_attr.height,
-                        &src_x, &src_y, &dest_x, &dest_y,
-                        &intersection_width, &intersection_height);
-                if (intersection_is_valid) {
-                    Picture src_pic = XRenderCreatePicture(d, src_w, src_attr.depth == 24 ? format_24 : format_32, 0, NULL);
-                    if (src_pic == None) exit_error("Creating source XRender picture failed");
-
-                    int num_holes;
-                    XRectangle *holes = XShapeGetRectangles(d, src_w, ShapeBounding, &num_holes, &dummy_int);
-                    Pixmap mask = XCreatePixmap(d, root, src_attr.width, src_attr.height, 1);
-                    GC mask_gc = XCreateGC(d, mask, 0, NULL);
-                    Picture mask_pic = XRenderCreatePicture(d, mask, format_1, 0, NULL);
-                    if (mask_pic == None) exit_error("Creating mask XRender picture failed");
-                    XSetForeground(d, mask_gc, BlackPixel(d, DefaultScreen(d)));
-                    XFillRectangle(d, mask, mask_gc, 0, 0, src_attr.width, src_attr.height);
-                    XSetForeground(d, mask_gc, WhitePixel(d, DefaultScreen(d)));
-                    for (int i = 0; i < num_holes; i++) {
-                        XRectangle hole = holes[i];
-                        XFillRectangle(d, mask, mask_gc, hole.x, hole.y, hole.width, hole.height);
-                    }
-                    XFree(holes);
-                    XFreeGC(d, mask_gc);
-
-                    int op = src_attr.depth == 32 ? PictOpOver : PictOpSrc;
-                    XRenderComposite(d, op, src_pic, mask_pic, dest_pic, src_x, src_y, src_x, src_y, dest_x, dest_y, intersection_width, intersection_height);
-
-                    XRenderFreePicture(d, src_pic);
-                    XRenderFreePicture(d, mask_pic);
-                    XFreePixmap(d, mask);
-                }
-            }
-            XFree(windows);
-
-            XCopyArea(d, dest_pixmap, final_pixmap, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
-
-            get_cursor_position(d, root, &cursor_x, &cursor_y);
-            double scale = 2.0;
-            XFixed scale_f = XDoubleToFixed(1.0 / scale);
-            XFixed one_f = XDoubleToFixed(1.0);
-            XFixed zero_f = XDoubleToFixed(0.0);
-            XTransform identity = {{
-                {one_f, zero_f, zero_f},
-                {zero_f, one_f, zero_f},
-                {zero_f, zero_f, one_f}
-            }};
-            XTransform scale_transform = {{
-                {scale_f, zero_f, zero_f},
-                {zero_f, scale_f, zero_f},
-                {zero_f, zero_f, one_f}
-            }};
-
-            XRenderSetPictureTransform(d, dest_pic, &scale_transform);
-
-            int scaled_cursor_x = cursor_x * scale;
-            int scaled_cursor_y = cursor_y * scale;
-            int half_width = width / 2;
-            int half_height = height / 2;
-            XRenderComposite(d, PictOpSrc, dest_pic, None, final_pic, scaled_cursor_x - half_width, scaled_cursor_y - half_height, 0, 0, cursor_x - half_width, cursor_y - half_height, width, height);
-
-            XRenderSetPictureTransform(d, dest_pic, &identity);
-
-            XCopyArea(d, final_pixmap, w, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
-
-            // Consume one damage event to prevent infinite loop
+        if (has_input || has_damage) {
+            //XSync(d, false);
+            // Redraw the window contents
+            draw(
+                    width, height, scale, cursor_x, cursor_y,
+                    root_background_pixmap, dest_pixmap, final_pixmap,
+                    dest_pic, final_pic, root_attr, dest_attr, root, w, d, gc,
+                    format_32, format_24, format_1);
+            // Wait for completion
             XEvent x_ev;
             wait_for_event(d, &x_ev, damage_notify_event);
+            wait_for_event(d, &x_ev, NoExpose);
         }
 
-        XRaiseWindow(d, w);
-        XSync(d, false);
+        /*
+        while (XPending(d) > 0) {
+            XEvent x_ev;
+            XNextEvent(d, &x_ev);
+        }
+        */
+
+        // Sleep
+        clock_gettime(CLOCK_MONOTONIC_RAW, &time);
+        const long one_second = 1000000000;
+        const long target_nsec = one_second / rate;
+        long delta_nsec =
+            (time.tv_sec - prev_time.tv_sec) * one_second
+            + (time.tv_nsec - prev_time.tv_nsec);
+        if (delta_nsec < target_nsec) {
+            struct timespec duration = {
+                .tv_sec = 0,
+                .tv_nsec = target_nsec - delta_nsec
+            };
+            struct timespec remaining = {
+                .tv_nsec = 1
+            };
+            int success = -1;
+            while (remaining.tv_nsec > 0 && success != 0) {
+                success = nanosleep(&duration, &remaining);
+                duration = remaining;
+            }
+        }
+        XSync(d, true);
+
+        //XRaiseWindow(d, w);
     }
 
+    XDestroyWindow(d, w);
+    XFreePixmap(d, dest_pixmap);
+    XRenderFreePicture(d, dest_pic);
+    XFreePixmap(d, final_pixmap);
+    XRenderFreePicture(d, final_pic);
     XDamageDestroy(d, damage);
     XCloseDisplay(d);
 
     udev_unref(udev);
+    close(li_fd);
     libinput_unref(li);
 
     return 0;
