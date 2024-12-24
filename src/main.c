@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/extensions/Xdamage.h>
@@ -7,16 +9,23 @@
 #include <X11/extensions/shape.h>
 
 #include <libinput.h>
+#include <libevdev-1.0/libevdev/libevdev.h>
 
 #include <linux/input-event-codes.h>
 
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <time.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <sys/file.h>
 
 
 #ifndef DEFAULT_WIDTH
@@ -27,12 +36,214 @@
 #define DEFAULT_HEIGHT 400
 #endif
 
+#ifndef DEFAULT_WIDTH_STEP
+#define DEFAULT_WIDTH_STEP 50
+#endif
+
+#ifndef DEFAULT_HEIGHT_STEP
+#define DEFAULT_HEIGHT_STEP 50
+#endif
+
+#ifndef DEFAULT_ZOOM
+#define DEFAULT_ZOOM 2.0
+#endif
+
+#ifndef DEFAULT_ZOOM_SCALE
+#define DEFAULT_ZOOM_SCALE 0.05
+#endif
+
+#ifndef DEFAULT_ZOOM_STEP
+#define DEFAULT_ZOOM_STEP 0.5
+#endif
+
+#ifndef DEFAULT_RATE
+#define DEFAULT_RATE 60
+#endif
+
+#ifndef DEFAULT_QUIT_KEY
+#define DEFAULT_QUIT_KEY KEY_ESC
+#endif
+
+#ifndef DEFAULT_GROW_WIDTH_KEY
+#define DEFAULT_GROW_WIDTH_KEY KEY_RIGHT
+#endif
+
+#ifndef DEFAULT_SHRINK_WIDTH_KEY
+#define DEFAULT_SHRINK_WIDTH_KEY KEY_LEFT
+#endif
+
+#ifndef DEFAULT_GROW_HEIGHT_KEY
+#define DEFAULT_GROW_HEIGHT_KEY KEY_DOWN
+#endif
+
+#ifndef DEFAULT_SHRINK_HEIGHT_KEY
+#define DEFAULT_SHRINK_HEIGHT_KEY KEY_UP
+#endif
+
+#ifndef DEFAULT_ZOOM_IN_KEY
+#define DEFAULT_ZOOM_IN_KEY KEY_EQUAL
+#endif
+
+#ifndef DEFAULT_ZOOM_OUT_KEY
+#define DEFAULT_ZOOM_OUT_KEY KEY_MINUS
+#endif
+
+#ifndef DEFAULT_MODIFIER_KEYS
+#define DEFAULT_MODIFIER_KEYS KEY_LEFTMETA, KEY_LEFTCTRL
+#define NUM_DEFAULT_MODIFIER_KEYS 2
+#endif
+
+#ifndef MAX_SCALE
+#define MAX_SCALE 10.0
+#endif
+
+#ifndef MIN_SCALE
+#define MIN_SCALE 1.0
+#endif
+
 #ifndef WINDOW_TITLE
 #define WINDOW_TITLE "Magnifier"
 #endif
 static const unsigned char WINDOW_TITLE_BYTES[] = WINDOW_TITLE;
 
+#ifndef PIDFILE_NAME
+#define PIDFILE_NAME "mgnfx.pid"
+#endif
+static char pidfile_name[256] = PIDFILE_NAME;
+
 static const int ATOM_SIZE = 32;
+
+
+// Print an error message to stderr, then exit with status 1
+void exit_error(const char *msg) {
+    fprintf(stderr, "%s\n", msg);
+    exit(1);
+}
+
+void exit_errno(const char *msg) {
+    fprintf(stderr, "%s: %s.\n", msg, strerror(errno));
+    exit(1);
+}
+
+void exit_error_if(bool cond, const char *msg) {
+    if (cond) exit_error(msg);
+}
+
+void exit_errno_if(int cond, const char *msg) {
+    if (cond == -1) exit_errno(msg);
+}
+
+
+struct opts {
+    unsigned int width;
+    unsigned int height;
+    unsigned int width_step;
+    unsigned int height_step;
+    double zoom;
+    double zoom_scale;
+    double zoom_step;
+    unsigned int rate;
+
+    uint32_t quit_key;
+    uint32_t grow_width_key;
+    uint32_t shrink_width_key;
+    uint32_t grow_height_key;
+    uint32_t shrink_height_key;
+    uint32_t zoom_in_key;
+    uint32_t zoom_out_key;
+    uint32_t modifier_keys[10];
+    unsigned int num_modifier_keys;
+};
+
+static uint32_t get_key_by_name(const char *name) {
+    int key = libevdev_event_code_from_name(EV_KEY, name);
+    if (key < 0) {
+        fprintf(stderr, "`%s` is not a valid key name\n", name);
+        exit(1);
+    } else {
+        return key;
+    }
+}
+
+static void get_opts(int argc, char **argv, struct opts *opts) {
+    *opts = (struct opts) {
+        .width = DEFAULT_WIDTH,
+        .height = DEFAULT_HEIGHT,
+        .width_step = DEFAULT_WIDTH_STEP,
+        .height_step = DEFAULT_HEIGHT_STEP,
+        .zoom = DEFAULT_ZOOM,
+        .zoom_scale = DEFAULT_ZOOM_SCALE,
+        .zoom_step = DEFAULT_ZOOM_STEP,
+        .rate = DEFAULT_RATE,
+        .quit_key = DEFAULT_QUIT_KEY,
+        .grow_width_key = DEFAULT_GROW_WIDTH_KEY,
+        .shrink_width_key = DEFAULT_SHRINK_WIDTH_KEY,
+        .grow_height_key = DEFAULT_GROW_HEIGHT_KEY,
+        .zoom_in_key = DEFAULT_ZOOM_IN_KEY,
+        .zoom_out_key = DEFAULT_ZOOM_OUT_KEY
+    };
+
+    int optchar;
+    while ((optchar = getopt(argc, argv, "w:h:W:H:s:z:Z:r:q:i:I:e:E:n:o:m:")) != -1) {
+        switch (optchar) {
+            case 'w':
+                opts->width = atoi(optarg);
+                break;
+            case 'h':
+                opts->height = atoi(optarg);
+                break;
+            case 'W':
+                opts->width_step = atoi(optarg);
+                break;
+            case 'H':
+                opts->height_step = atoi(optarg);
+                break;
+            case 's':
+                opts->zoom = strtod(optarg, NULL);
+                break;
+            case 'z':
+                opts->zoom_scale = strtod(optarg, NULL);
+                break;
+            case 'Z':
+                opts->zoom_step = strtod(optarg, NULL);
+                break;
+            case 'r':
+                opts->rate = atoi(optarg);
+                break;
+            case 'q':
+                opts->quit_key = get_key_by_name(optarg);
+                break;
+            case 'i':
+                opts->grow_width_key = get_key_by_name(optarg);
+                break;
+            case 'I':
+                opts->shrink_width_key = get_key_by_name(optarg);
+                break;
+            case 'n':
+                opts->zoom_in_key = get_key_by_name(optarg);
+                break;
+            case 'o':
+                opts->zoom_out_key = get_key_by_name(optarg);
+                break;
+            case 'm':
+                const unsigned int max_modifier_keys = sizeof(opts->modifier_keys) / sizeof(opts->modifier_keys[0]);
+                if (opts->num_modifier_keys >= max_modifier_keys) {
+                    exit_error("Too many modifier keys");
+                } else {
+                    opts->modifier_keys[opts->num_modifier_keys] = get_key_by_name(optarg);
+                    opts->num_modifier_keys++;
+                }
+                break;
+        }
+    }
+    if (opts->num_modifier_keys == 0) {
+        opts->num_modifier_keys = NUM_DEFAULT_MODIFIER_KEYS;
+        uint32_t default_modifier_keys[] = { DEFAULT_MODIFIER_KEYS };
+        for (unsigned int i = 0; i < opts->num_modifier_keys; i++) {
+            opts->modifier_keys[i] = default_modifier_keys[i];
+        }
+    }
+}
 
 
 static int xerror_handler(Display *d, XErrorEvent *e) {
@@ -55,15 +266,6 @@ static const struct libinput_interface li_interface = {
     .close_restricted = _li_close,
 };
 
-// Print an error message to stderr, then exit with status 1
-void exit_error(const char *msg) {
-    fprintf(stderr, "%s\n", msg);
-    exit(1);
-}
-
-void exit_error_if(bool cond, const char *msg) {
-    if (cond) exit_error(msg);
-}
 
 // Try to get an atom with the given name with XInternAtom and exit the program
 // if it doesn't exist (if XInternAtom returns `None`)
@@ -139,7 +341,7 @@ static bool get_intersection(
     *width = bottom_right_x - top_left_x;
     *height = bottom_right_y - top_left_y;
 
-    bool intersection_is_valid = *width > 1 && *height > 1;
+    bool intersection_is_valid = *width > 0 && *height > 0;
     return intersection_is_valid;
 }
 
@@ -191,16 +393,29 @@ void draw(
     }
 
     Window dummy_window;
-    unsigned int num_windows;
-    Window *windows;
+
+    unsigned int num_windows = 0;
+    Window *windows = NULL;
     XQueryTree(d, root, &dummy_window, &dummy_window, &windows, &num_windows);
+
     for (unsigned int i = 0; i < num_windows; i++) {
         Window src_w = windows[i];
         if (src_w == w) continue;
 
+        Status status;
+
         XWindowAttributes src_attr;
-        Status err = XGetWindowAttributes(d, src_w, &src_attr);
-        if (err == 0 || src_attr.map_state != IsViewable) continue;
+        status = XGetWindowAttributes(d, src_w, &src_attr);
+        if (status == 0 || src_attr.map_state != IsViewable) continue;
+
+        // Don't draw windows which aren't direct children of the root window
+        Window parent_w = None;
+        unsigned int num_child_windows;
+        Window *child_windows = NULL;
+        status = XQueryTree(d, src_w, &dummy_window, &parent_w, &child_windows, &num_child_windows);
+        if (status == 0) continue;
+        if (child_windows != NULL) XFree(child_windows);
+        if (parent_w != root) continue;
 
         int src_x;
         int src_y;
@@ -213,16 +428,15 @@ void draw(
                 src_attr.x, src_attr.y, src_attr.width, src_attr.height,
                 &src_x, &src_y, &dest_x, &dest_y,
                 &intersection_width, &intersection_height);
-        if (intersection_is_valid) {
-            Picture src_pic = XRenderCreatePicture(d, src_w, src_attr.depth == 24 ? format_24 : format_32, 0, NULL);
-            //if (src_pic == None) exit_error("Creating source XRender picture failed");
+        if (!intersection_is_valid) continue;
 
-            int num_rects;
+        Picture src_pic = XRenderCreatePicture(d, src_w, src_attr.depth == 24 ? format_24 : format_32, 0, NULL);
+        if (src_pic != None) {
+            int num_rects = 0;
             XRectangle *rects = XShapeGetRectangles(d, src_w, ShapeBounding, &num_rects, &dummy_int);
             Pixmap mask = XCreatePixmap(d, root, src_attr.width, src_attr.height, 1);
             GC mask_gc = XCreateGC(d, mask, 0, NULL);
             Picture mask_pic = XRenderCreatePicture(d, mask, format_1, 0, NULL);
-            //if (mask_pic == None) exit_error("Creating mask XRender picture failed");
             XSetForeground(d, mask_gc, BlackPixel(d, DefaultScreen(d)));
             XFillRectangle(d, mask, mask_gc, 0, 0, src_attr.width, src_attr.height);
             XSetForeground(d, mask_gc, WhitePixel(d, DefaultScreen(d)));
@@ -230,7 +444,7 @@ void draw(
                 XRectangle rect = rects[i];
                 XFillRectangle(d, mask, mask_gc, rect.x, rect.y, rect.width, rect.height);
             }
-            XFree(rects);
+            if (rects != NULL) XFree(rects);
             XFreeGC(d, mask_gc);
 
             int op = src_attr.depth == 32 ? PictOpOver : PictOpSrc;
@@ -241,21 +455,14 @@ void draw(
             XFreePixmap(d, mask);
         }
     }
-    XFree(windows);
+    if (windows != NULL) XFree(windows);
 
     XCopyArea(d, dest_pixmap, final_pixmap, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
-    //XRenderComposite(d, PictOpSrc, dest_pic, None, final_pic, 0, 0, 0, 0, 0, 0, root_attr.width, root_attr.height);
 
     XFixed scale_f = XDoubleToFixed(1.0 / scale);
     XFixed one_f = XDoubleToFixed(1.0);
     XFixed zero_f = XDoubleToFixed(0.0);
-    /*
-    XTransform identity = {{
-       {one_f, zero_f, zero_f},
-       {zero_f, one_f, zero_f},
-       {zero_f, zero_f, one_f}
-       }};
-    */
+
     XTransform scale_transform = {{
         {scale_f, zero_f, zero_f},
             {zero_f, scale_f, zero_f},
@@ -264,7 +471,6 @@ void draw(
 
     XRenderSetPictureTransform(d, dest_pic, &scale_transform);
 
-    get_cursor_position(d, root, &cursor_x, &cursor_y);
     int scaled_cursor_x = cursor_x * scale;
     int scaled_cursor_y = cursor_y * scale;
     int half_width = width / 2;
@@ -275,25 +481,81 @@ void draw(
 
     XRenderComposite(d, PictOpSrc, dest_pic, None, final_pic, scaled_cursor_x - half_width, scaled_cursor_y - half_height, 0, 0, cursor_x - half_width, cursor_y - half_height, width, height);
 
-    //XRenderSetPictureTransform(d, dest_pic, &identity);
-
     XCopyArea(d, final_pixmap, w, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
-
 }
 
-int main() {
+int main(int argc, char **argv) {
+    struct opts opts;
+    get_opts(argc, argv, &opts);
+
+    char *display = getenv("DISPLAY");
+    if (display == NULL) exit_error("Reading the `DISPLAY` environment variable failed");
+
+    // Exit if another instance is already running
+    strcat(pidfile_name, display);
+    char *xdg_runtime_dir_path = getenv("XDG_RUNTIME_DIR");
+    int xdg_runtime_dir = -1;
+    if (xdg_runtime_dir_path != NULL) {
+        pid_t pid = getpid();
+
+        xdg_runtime_dir = open(xdg_runtime_dir_path, O_PATH);
+        exit_errno_if(xdg_runtime_dir, "Opening XDG runtime directory failed");
+        int pidfile = openat(xdg_runtime_dir, pidfile_name, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+        exit_errno_if(pidfile, "Opening pidfile failed");
+
+        exit_errno_if(flock(pidfile, LOCK_EX), "Locking pidfile failed");
+
+        pid_t oldpid;
+        size_t bytes_read = 0;
+        ssize_t r = 1;
+        while (r > 0) {
+            r = read(pidfile, ((char *) &oldpid) + bytes_read, sizeof(oldpid) - bytes_read);
+            exit_errno_if(r, "Reading pidfile failed");
+            bytes_read += r;
+        }
+
+        if (bytes_read == sizeof(oldpid) && pid != oldpid) {
+            char *exe = realpath("/proc/self/exe", NULL);
+            char old_exe_path[256];
+            snprintf(old_exe_path, sizeof(old_exe_path), "/proc/%u/exe", oldpid);
+            old_exe_path[sizeof(old_exe_path) - 1] = 0;
+            char *old_exe = realpath(old_exe_path, NULL);
+
+            if (exe != NULL && old_exe != NULL && strcmp(exe, old_exe) == 0) {
+                exit_error("Another instance is already running.");
+            }
+            free(exe);
+            free(old_exe);
+        }
+
+        exit_errno_if(ftruncate(pidfile, 0), "Truncating pidfile failed");
+        exit_errno_if(lseek(pidfile, 0, SEEK_SET), "Seeking to start of pidfile failed");
+        size_t bytes_written = 0;
+        ssize_t w = 1;
+        while (w > 0) {
+            w = write(pidfile, ((char *) &pid) + bytes_written, sizeof(pid) - bytes_written);
+            exit_errno_if(w, "Writing pidfile failed");
+            bytes_written += w;
+        }
+
+        exit_errno_if(flock(pidfile, LOCK_UN), "Unlocking pidfile failed");
+        exit_errno_if(close(pidfile), "Closing pidfile failed");
+    }
+
     // An int to pass as a fishing pointer to functions which will fail if
     // we pass NULL in cases where we don't care about the returned value
     int dummy_int;
 
     // Xlib setup
-    Display *d = XOpenDisplay(NULL);
+    Display *d = XOpenDisplay(display);
     if (d == NULL) {
         exit_error("Failed to open X display");
     }
     Window root = XDefaultRootWindow(d);
     XWindowAttributes root_attr;
     XGetWindowAttributes(d, root, &root_attr);
+
+    int screen = DefaultScreen(d);
 
     // Set error handler to avoid exiting the program for non-fatal X errors
     XSetErrorHandler(xerror_handler);
@@ -325,7 +587,7 @@ int main() {
         init_extension(d, required_extensions[i]);
     }
 
-    GC gc = DefaultGC(d, 0);
+    GC gc = DefaultGC(d, screen);
 
     // Create the window
     int attr_mask = CWOverrideRedirect | CWBackPixel;
@@ -403,17 +665,19 @@ int main() {
     // We want to know about substructure events because these tell us when new
     // windows are created, raised, fullscreened, etc. and let us keep our
     // magnifier window on top when this happens.
-    XSelectInput(d, root, SubstructureNotifyMask | StructureNotifyMask | PropertyChangeMask);
+    XSelectInput(d, root, SubstructureNotifyMask);
     int damage_event_base;
     XDamageQueryExtension(d, &damage_event_base, &dummy_int);
     int damage_notify_event = damage_event_base + XDamageNotify;
     Damage damage = XDamageCreate(d, root, XDamageReportRawRectangles);
 
     // Setup getting events from libinput
+    char *seat = getenv("XDG_SEAT");
+    if (seat == NULL) exit_error("Reading `XDG_SEAT` environment variable failed");
     struct udev *udev = udev_new();
     struct libinput *li = libinput_udev_create_context(
             &li_interface, NULL, udev);
-    libinput_udev_assign_seat(li, "seat0");
+    libinput_udev_assign_seat(li, seat);
     libinput_dispatch(li);
     int li_fd = libinput_get_fd(li);
 
@@ -463,26 +727,12 @@ int main() {
     int cursor_x = 0;
     int cursor_y = 0;
     get_cursor_position(d, root, &cursor_x, &cursor_y);
-    int width = DEFAULT_WIDTH;
-    int height = DEFAULT_HEIGHT;
-    double scale = 2.0;
-    int rate = 60;
+    int width = opts.width;
+    int height = opts.height;
+    double scale = opts.zoom;
+    int rate = opts.rate;
 
-    uint32_t modifiers[] = {
-        KEY_LEFTMETA,
-        KEY_LEFTCTRL
-    };
-    const int num_modifiers = sizeof(modifiers) / sizeof(modifiers[0]);
-    int modifiers_held = 0;
-
-    uint32_t quit = KEY_ESC;
-
-    uint32_t grow_width = KEY_RIGHT;
-    uint32_t shrink_width = KEY_LEFT;
-    uint32_t grow_height = KEY_DOWN;
-    uint32_t shrink_height = KEY_UP;
-    int width_step = 50;
-    int height_step = 50;
+    unsigned int modifiers_held = 0;
 
     draw(
             width, height, scale, cursor_x, cursor_y,
@@ -493,6 +743,9 @@ int main() {
 
     bool keep_running = true;
     bool input_grabbed = false;
+    bool mouse_held = false;
+    int click_x;
+    int click_y;
     while (keep_running) {
         poll(pollfds, num_fds, -1);
 
@@ -504,6 +757,8 @@ int main() {
         bool has_damage = false;
         bool has_input = false;
 
+        bool got_cursor_position = get_cursor_position(d, root, &cursor_x, &cursor_y);
+
         // If there are new events from libinput
         if (li_pollfd->revents & POLLIN) {
             has_input = true;
@@ -511,6 +766,34 @@ int main() {
             struct libinput_event *li_ev;
             while ((li_ev = libinput_get_event(li)) != NULL) {
                 switch (libinput_event_get_type(li_ev)) {
+                    case LIBINPUT_EVENT_POINTER_MOTION:
+                        if (!input_grabbed) break;
+                        if (mouse_held && got_cursor_position) {
+                            width = abs(cursor_x - click_x) * 2;
+                            height = abs(cursor_y - click_y) * 2;
+                        }
+                        break;
+                    case LIBINPUT_EVENT_POINTER_BUTTON:
+                        if (!input_grabbed) break;
+                        struct libinput_event_pointer *li_ev_pointer =
+                            libinput_event_get_pointer_event(li_ev);
+                        uint32_t button = libinput_event_pointer_get_button(li_ev_pointer);
+                        enum libinput_button_state button_state = libinput_event_pointer_get_button_state(li_ev_pointer);
+                        if (button == BTN_LEFT) {
+                            switch (button_state) {
+                                case LIBINPUT_BUTTON_STATE_PRESSED:
+                                    if (got_cursor_position) {
+                                        mouse_held = true;
+                                        click_x = cursor_x;
+                                        click_y = cursor_y;
+                                    }
+                                    break;
+                                case LIBINPUT_BUTTON_STATE_RELEASED:
+                                    mouse_held = false;
+                                    break;
+                            }
+                        }
+                        break;
                     case LIBINPUT_EVENT_KEYBOARD_KEY:
                         struct libinput_event_keyboard *li_ev_key =
                             libinput_event_get_keyboard_event(li_ev);
@@ -519,8 +802,8 @@ int main() {
                         enum libinput_key_state state =
                             libinput_event_keyboard_get_key_state(li_ev_key);
                         int modifier = -1;
-                        for (int i = 0; i < num_modifiers; i++) {
-                            if (keycode == modifiers[i]) {
+                        for (unsigned int i = 0; i < opts.num_modifier_keys; i++) {
+                            if (keycode == opts.modifier_keys[i]) {
                                 modifier = i;
                                 break;
                             }
@@ -529,7 +812,7 @@ int main() {
                             case LIBINPUT_KEY_STATE_PRESSED:
                                 if (modifier != -1) {
                                     modifiers_held++;
-                                    bool all_modifiers_held = modifiers_held == num_modifiers;
+                                    bool all_modifiers_held = modifiers_held == opts.num_modifier_keys;
                                     if (all_modifiers_held) {
                                         input_grabbed =
                                             XGrabPointer(d, w, true, NoEventMask, GrabModeAsync, GrabModeAsync, None, None, CurrentTime) == GrabSuccess
@@ -547,38 +830,39 @@ int main() {
                                     XUngrabPointer(d, CurrentTime);
                                     XUngrabKeyboard(d, CurrentTime);
                                     input_grabbed = false;
-                                } else if (keycode == quit) {
+                                } else if (keycode == opts.quit_key) {
                                     keep_running = false;
                                 }
                                 if (input_grabbed) {
-                                    if (keycode == grow_width) {
-                                        width = int_min(width + width_step, root_attr.width);
-                                    } else if (keycode == shrink_width) {
-                                        width = int_max(width - width_step, 1);
-                                    } else if (keycode == grow_height) {
-                                        height = int_min(height + height_step, root_attr.height);
-                                    } else if (keycode == shrink_height) {
-                                        height = int_max(height - height_step, 1);
+                                    if (keycode == opts.grow_width_key) {
+                                        width = int_min(width + opts.width_step, root_attr.width);
+                                    } else if (keycode == opts.shrink_width_key) {
+                                        width = int_max(width - opts.width_step, 1);
+                                    } else if (keycode == opts.grow_height_key) {
+                                        height = int_min(height + opts.height_step, root_attr.height);
+                                    } else if (keycode == opts.shrink_height_key) {
+                                        height = int_max(height - opts.height_step, 1);
+                                    } else if (keycode == opts.zoom_in_key) {
+                                        scale += opts.zoom_step;
+                                        if (scale > MAX_SCALE) scale = MAX_SCALE;
+                                    } else if (keycode == opts.zoom_out_key) {
+                                        scale -= opts.zoom_step;
+                                        if (scale < MIN_SCALE) scale = MIN_SCALE;
                                     }
                                 }
                                 break;
                         }
                         break;
-                    case LIBINPUT_EVENT_POINTER_MOTION:
-                        has_input = true;
-                        break;
                     case LIBINPUT_EVENT_POINTER_AXIS:
-                        has_input = true;
-                        bool all_modifiers_held = modifiers_held == num_modifiers;
-                        if (all_modifiers_held) {
+                        if (input_grabbed) {
                             struct libinput_event_pointer *li_ev_axis =
                                 libinput_event_get_pointer_event(li_ev);
                             double scroll = libinput_event_pointer_get_axis_value(li_ev_axis, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
-                            scale -= scroll / 20.0;
-                            if (scale < 1.0) {
-                                scale = 1.0;
-                            } else if (scale > 10.0) {
-                                scale = 10.0;
+                            scale -= scroll * opts.zoom_scale;
+                            if (scale < MIN_SCALE) {
+                                scale = MIN_SCALE;
+                            } else if (scale > MAX_SCALE) {
+                                scale = MAX_SCALE;
                             }
                         }
                         break;
@@ -589,36 +873,22 @@ int main() {
         }
 
         // If there are new events from Xlib
-        //if (!has_input && x_pollfd->revents & POLLIN) {
         if (x_pollfd->revents & POLLIN) {
             bool more = false;
             while (XPending(d) > 0 || more) {
                 XEvent x_ev;
                 XNextEvent(d, &x_ev);
-                //printf("%u\n", x_ev.type);
                 if (x_ev.type == damage_notify_event) {
-                    //printf("%u\n", x_ev.type);
                     has_damage = true;
                     more = ((XDamageNotifyEvent *) &x_ev)->more;
-                    //XSync(d, true);
-                }/* if (x_ev.type == NoExpose) {
-                    //has_damage = true;
-                }*/
+                    if (!more) break;
+                }
             }
             XDamageSubtract(d, damage, None, None);
             XRaiseWindow(d, w);
         }
-        //XSync(d, true);
-
-        /*
-        if (has_damage) {
-            XEvent x_ev;
-            wait_for_event(d, &x_ev, NoExpose);
-        }
-        */
 
         if (has_input || has_damage) {
-            //XSync(d, false);
             // Redraw the window contents
             draw(
                     width, height, scale, cursor_x, cursor_y,
@@ -631,14 +901,8 @@ int main() {
             wait_for_event(d, &x_ev, NoExpose);
         }
 
-        /*
-        while (XPending(d) > 0) {
-            XEvent x_ev;
-            XNextEvent(d, &x_ev);
-        }
-        */
 
-        // Sleep
+        // Sleep to prevent re-drawing faster than update rate
         clock_gettime(CLOCK_MONOTONIC_RAW, &time);
         const long one_second = 1000000000;
         const long target_nsec = one_second / rate;
@@ -654,16 +918,16 @@ int main() {
                 .tv_nsec = 1
             };
             int success = -1;
-            while (remaining.tv_nsec > 0 && success != 0) {
+            while (success != 0) {
                 success = nanosleep(&duration, &remaining);
                 duration = remaining;
             }
         }
-        XSync(d, true);
 
-        //XRaiseWindow(d, w);
+        XSync(d, true);
     }
 
+    // Clean up X objects
     XDestroyWindow(d, w);
     XFreePixmap(d, dest_pixmap);
     XRenderFreePicture(d, dest_pic);
@@ -672,9 +936,16 @@ int main() {
     XDamageDestroy(d, damage);
     XCloseDisplay(d);
 
+    // Clean up libinput
     udev_unref(udev);
     close(li_fd);
     libinput_unref(li);
+
+    // Remove pidfile, if it was created
+    if (xdg_runtime_dir != -1) {
+        exit_errno_if(unlinkat(xdg_runtime_dir, pidfile_name, 0), "Removing pidfile failed");
+        exit_errno_if(close(xdg_runtime_dir), "Closing XDG runtime dir failed");
+    }
 
     return 0;
 }
