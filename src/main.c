@@ -183,6 +183,31 @@ static void get_opts(int argc, char **argv, struct opts *opts) {
         .zoom_out_key = DEFAULT_ZOOM_OUT_KEY
     };
 
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0) {
+            puts(
+                    "Options:\n"
+                    "--help        prints this message and exits\n"
+                    "-w PIXELS     magnifier width in pixels\n"
+                    "-h PIXELS     magnifier height in pixels\n"
+                    "-W PIXELS     width resize increment in pixels\n"
+                    "-H PIXELS     height resize increment in pixels\n"
+                    "-s DECIMAL    zoom scale\n"
+                    "-z DECIMAL    zoom scale coefficient\n"
+                    "-Z DECIMAL    zoom scale increment\n"
+                    "-r NUMBER     max redraws per second\n"
+                    "-q KEY_NAME   key binding to exit the program\n"
+                    "-i KEY_NAME   key binding to increase magnifier width\n"
+                    "-I KEY_NAME   key binding to decrease magnifier width\n"
+                    "-e KEY_NAME   key binding to increase magnifier height\n"
+                    "-E KEY_NAME   key binding to decrease magnifier height\n"
+                    "-n KEY_NAME   key binding to zoom in\n"
+                    "-o KEY_NAME   key binding to zoom out\n"
+                    "-m KEY_NAME   specify a modifier key\n");
+            exit(1);
+        }
+    }
+
     int optchar;
     while ((optchar = getopt(argc, argv, "w:h:W:H:s:z:Z:r:q:i:I:e:E:n:o:m:")) != -1) {
         switch (optchar) {
@@ -218,6 +243,12 @@ static void get_opts(int argc, char **argv, struct opts *opts) {
                 break;
             case 'I':
                 opts->shrink_width_key = get_key_by_name(optarg);
+                break;
+            case 'e':
+                opts->grow_height_key = get_key_by_name(optarg);
+                break;
+            case 'E':
+                opts->shrink_height_key = get_key_by_name(optarg);
                 break;
             case 'n':
                 opts->zoom_in_key = get_key_by_name(optarg);
@@ -885,7 +916,6 @@ int main(int argc, char **argv) {
                 }
             }
             XDamageSubtract(d, damage, None, None);
-            XRaiseWindow(d, w);
         }
 
         if (has_input || has_damage) {
@@ -924,6 +954,7 @@ int main(int argc, char **argv) {
             }
         }
 
+        XRaiseWindow(d, w);
         XSync(d, true);
     }
 
