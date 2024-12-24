@@ -27,6 +27,8 @@
 #include <stdlib.h>
 #include <sys/file.h>
 
+#define XSTR(s) #s
+#define STR(s) XSTR(s)
 
 #ifndef DEFAULT_WIDTH
 #define DEFAULT_WIDTH 400
@@ -61,35 +63,35 @@
 #endif
 
 #ifndef DEFAULT_QUIT_KEY
-#define DEFAULT_QUIT_KEY KEY_ESC
+#define DEFAULT_QUIT_KEY "KEY_ESC"
 #endif
 
 #ifndef DEFAULT_GROW_WIDTH_KEY
-#define DEFAULT_GROW_WIDTH_KEY KEY_RIGHT
+#define DEFAULT_GROW_WIDTH_KEY "KEY_RIGHT"
 #endif
 
 #ifndef DEFAULT_SHRINK_WIDTH_KEY
-#define DEFAULT_SHRINK_WIDTH_KEY KEY_LEFT
+#define DEFAULT_SHRINK_WIDTH_KEY "KEY_LEFT"
 #endif
 
 #ifndef DEFAULT_GROW_HEIGHT_KEY
-#define DEFAULT_GROW_HEIGHT_KEY KEY_DOWN
+#define DEFAULT_GROW_HEIGHT_KEY "KEY_DOWN"
 #endif
 
 #ifndef DEFAULT_SHRINK_HEIGHT_KEY
-#define DEFAULT_SHRINK_HEIGHT_KEY KEY_UP
+#define DEFAULT_SHRINK_HEIGHT_KEY "KEY_UP"
 #endif
 
 #ifndef DEFAULT_ZOOM_IN_KEY
-#define DEFAULT_ZOOM_IN_KEY KEY_EQUAL
+#define DEFAULT_ZOOM_IN_KEY "KEY_EQUAL"
 #endif
 
 #ifndef DEFAULT_ZOOM_OUT_KEY
-#define DEFAULT_ZOOM_OUT_KEY KEY_MINUS
+#define DEFAULT_ZOOM_OUT_KEY "KEY_MINUS"
 #endif
 
 #ifndef DEFAULT_MODIFIER_KEYS
-#define DEFAULT_MODIFIER_KEYS KEY_LEFTMETA, KEY_LEFTCTRL
+#define DEFAULT_MODIFIER_KEYS "KEY_LEFTMETA", "KEY_LEFTCTRL"
 #define NUM_DEFAULT_MODIFIER_KEYS 2
 #endif
 
@@ -175,12 +177,13 @@ static void get_opts(int argc, char **argv, struct opts *opts) {
         .zoom_scale = DEFAULT_ZOOM_SCALE,
         .zoom_step = DEFAULT_ZOOM_STEP,
         .rate = DEFAULT_RATE,
-        .quit_key = DEFAULT_QUIT_KEY,
-        .grow_width_key = DEFAULT_GROW_WIDTH_KEY,
-        .shrink_width_key = DEFAULT_SHRINK_WIDTH_KEY,
-        .grow_height_key = DEFAULT_GROW_HEIGHT_KEY,
-        .zoom_in_key = DEFAULT_ZOOM_IN_KEY,
-        .zoom_out_key = DEFAULT_ZOOM_OUT_KEY
+        .quit_key = get_key_by_name(DEFAULT_QUIT_KEY),
+        .grow_width_key = get_key_by_name(DEFAULT_GROW_WIDTH_KEY),
+        .shrink_width_key = get_key_by_name(DEFAULT_SHRINK_WIDTH_KEY),
+        .grow_height_key = get_key_by_name(DEFAULT_GROW_HEIGHT_KEY),
+        .shrink_height_key = get_key_by_name(DEFAULT_SHRINK_HEIGHT_KEY),
+        .zoom_in_key = get_key_by_name(DEFAULT_ZOOM_IN_KEY),
+        .zoom_out_key = get_key_by_name(DEFAULT_ZOOM_OUT_KEY)
     };
 
     for (int i = 0; i < argc; i++) {
@@ -188,22 +191,32 @@ static void get_opts(int argc, char **argv, struct opts *opts) {
             puts(
                     "Options:\n"
                     "--help        prints this message and exits\n"
-                    "-w PIXELS     magnifier width in pixels\n"
-                    "-h PIXELS     magnifier height in pixels\n"
-                    "-W PIXELS     width resize increment in pixels\n"
-                    "-H PIXELS     height resize increment in pixels\n"
-                    "-s DECIMAL    zoom scale\n"
-                    "-z DECIMAL    zoom scale coefficient\n"
-                    "-Z DECIMAL    zoom scale increment\n"
-                    "-r NUMBER     max redraws per second\n"
-                    "-q KEY_NAME   key binding to exit the program\n"
-                    "-i KEY_NAME   key binding to increase magnifier width\n"
-                    "-I KEY_NAME   key binding to decrease magnifier width\n"
-                    "-e KEY_NAME   key binding to increase magnifier height\n"
-                    "-E KEY_NAME   key binding to decrease magnifier height\n"
-                    "-n KEY_NAME   key binding to zoom in\n"
-                    "-o KEY_NAME   key binding to zoom out\n"
-                    "-m KEY_NAME   specify a modifier key\n");
+                    "-w PIXELS     magnifier width in pixels (default " STR(DEFAULT_WIDTH) ")\n"
+                    "-h PIXELS     magnifier height in pixels (default " STR(DEFAULT_HEIGHT) ")\n"
+                    "-W PIXELS     width resize increment in pixels (default " STR(DEFAULT_WIDTH_STEP) ")\n"
+                    "-H PIXELS     height resize increment in pixels (default " STR(DEFAULT_HEIGHT_STEP) ")\n"
+                    "-s DECIMAL    zoom scale (default " STR(DEFAULT_ZOOM) ")\n"
+                    "-z DECIMAL    zoom scale coefficient (default " STR(DEFAULT_ZOOM_SCALE) ")\n"
+                    "-Z DECIMAL    zoom scale increment (default " STR(DEFAULT_ZOOM_STEP) ")\n"
+                    "-r NUMBER     max redraws per second (default " STR(DEFAULT_RATE) ")\n"
+                    "-q KEY_NAME   key binding to exit the program (default " DEFAULT_QUIT_KEY ")\n"
+                    "-i KEY_NAME   key binding to increase magnifier width (default " DEFAULT_GROW_WIDTH_KEY ")\n"
+                    "-I KEY_NAME   key binding to decrease magnifier width (default " DEFAULT_SHRINK_WIDTH_KEY ")\n"
+                    "-e KEY_NAME   key binding to increase magnifier height (default " DEFAULT_GROW_HEIGHT_KEY ")\n"
+                    "-E KEY_NAME   key binding to decrease magnifier height (default " DEFAULT_SHRINK_HEIGHT_KEY ")\n"
+                    "-n KEY_NAME   key binding to zoom in (default " DEFAULT_ZOOM_IN_KEY ")\n"
+                    "-o KEY_NAME   key binding to zoom out (default " DEFAULT_ZOOM_OUT_KEY ")\n"
+                    "-m KEY_NAME   specify a single modifier key\n"
+                    "The default modifier keys are " STR((DEFAULT_MODIFIER_KEYS)) "\n\n"
+                    "Usage:\n"
+"Press the quit key at any time to exit the program. While the program is\n"
+"running, the region around the mouse cursor is magnified according to the\n"
+"current zoom scale.\n\n"
+"When all the modifier keys are held, the following actions are available:\n"
+"- Resize the magnified region by clicking and dragging with the mouse\n"
+"- Resize the magnified region according to the resize increments using the resize keys\n"
+"- Change the zoom level by scrolling with the mouse (scaled by zoom scale coefficient)\n"
+"- Change the zoom level according to the zoom scale increment using the zoom in/out keys");
             exit(1);
         }
     }
@@ -269,9 +282,9 @@ static void get_opts(int argc, char **argv, struct opts *opts) {
     }
     if (opts->num_modifier_keys == 0) {
         opts->num_modifier_keys = NUM_DEFAULT_MODIFIER_KEYS;
-        uint32_t default_modifier_keys[] = { DEFAULT_MODIFIER_KEYS };
+        char *default_modifier_keys[] = { DEFAULT_MODIFIER_KEYS };
         for (unsigned int i = 0; i < opts->num_modifier_keys; i++) {
-            opts->modifier_keys[i] = default_modifier_keys[i];
+            opts->modifier_keys[i] = get_key_by_name(default_modifier_keys[i]);
         }
     }
 }
