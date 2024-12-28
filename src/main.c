@@ -335,7 +335,7 @@ Pixmap get_root_background_pixmap(Display *d, Window root) {
             d, root, root_pixmap, 0, 1, false, XA_PIXMAP, &actual_type,
             &actual_format, &nitems, &bytes_after, (unsigned char **) &prop);
 
-    if (status == Success) {
+    if (status == Success && prop != NULL) {
         Pixmap root_background_pixmap = *prop;
         XFree(prop);
         return root_background_pixmap;
@@ -586,6 +586,16 @@ int main(int argc, char **argv) {
         exit_errno_if(close(pidfile), "Closing pidfile failed");
     }
 
+    // Setup getting events from libinput
+    char *seat = getenv("XDG_SEAT");
+    if (seat == NULL) exit_error("Reading `XDG_SEAT` environment variable failed");
+    struct udev *udev = udev_new();
+    struct libinput *li = libinput_udev_create_context(
+            &li_interface, NULL, udev);
+    libinput_udev_assign_seat(li, seat);
+    libinput_dispatch(li);
+    int li_fd = libinput_get_fd(li);
+
     // An int to pass as a fishing pointer to functions which will fail if
     // we pass NULL in cases where we don't care about the returned value
     int dummy_int;
@@ -715,25 +725,6 @@ int main(int argc, char **argv) {
     int damage_notify_event = damage_event_base + XDamageNotify;
     Damage damage = XDamageCreate(d, root, XDamageReportRawRectangles);
 
-    // Setup getting events from libinput
-    char *seat = getenv("XDG_SEAT");
-    if (seat == NULL) exit_error("Reading `XDG_SEAT` environment variable failed");
-    struct udev *udev = udev_new();
-    struct libinput *li = libinput_udev_create_context(
-            &li_interface, NULL, udev);
-    libinput_udev_assign_seat(li, seat);
-    libinput_dispatch(li);
-    int li_fd = libinput_get_fd(li);
-
-    struct pollfd pollfds[] = {
-        { .fd = d_fd, .events = POLLIN },
-        { .fd = li_fd, .events = POLLIN }
-    };
-    int num_fds = sizeof(pollfds) / sizeof(pollfds[0]);
-
-    struct pollfd *x_pollfd = &pollfds[0];
-    struct pollfd *li_pollfd = &pollfds[1];
-
     // XRender setup
 
     // Format for windows with 32-bit colour (alpha + RGB)
@@ -760,8 +751,17 @@ int main(int argc, char **argv) {
 
     Pixmap root_background_pixmap = get_root_background_pixmap(d, root);
 
+    struct pollfd pollfds[] = {
+        { .fd = d_fd, .events = POLLIN },
+        { .fd = li_fd, .events = POLLIN }
+    };
+    int num_fds = sizeof(pollfds) / sizeof(pollfds[0]);
+
+    struct pollfd *x_pollfd = &pollfds[0];
+    struct pollfd *li_pollfd = &pollfds[1];
+
     // Show the window
-    XMapWindow(d, w);
+    XMapRaised(d, w);
     // Put the screen contents on the window initially
     XCopyArea(d, root, w, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
 
@@ -925,7 +925,7 @@ int main(int argc, char **argv) {
                 if (x_ev.type == damage_notify_event) {
                     has_damage = true;
                     more = ((XDamageNotifyEvent *) &x_ev)->more;
-                    if (!more) break;
+                    //if (!more) break;
                 }
             }
             XDamageSubtract(d, damage, None, None);
@@ -972,18 +972,19 @@ int main(int argc, char **argv) {
     }
 
     // Clean up X objects
-    XDestroyWindow(d, w);
+    /*
     XFreePixmap(d, dest_pixmap);
     XRenderFreePicture(d, dest_pic);
     XFreePixmap(d, final_pixmap);
     XRenderFreePicture(d, final_pic);
     XDamageDestroy(d, damage);
+    XDestroyWindow(d, w);
+    */
     XCloseDisplay(d);
 
     // Clean up libinput
-    udev_unref(udev);
-    close(li_fd);
     libinput_unref(li);
+    udev_unref(udev);
 
     // Remove pidfile, if it was created
     if (xdg_runtime_dir != -1) {
