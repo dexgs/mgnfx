@@ -1,6 +1,6 @@
 #!/usr/bin/env make
 CFLAGS += -Wall -Wextra
-LDFLAGS += -lX11 -lXfixes -lXdamage -lXcomposite -lXrender -lXext -linput -ludev -levdev
+LDFLAGS += -lX11 -lXfixes -lXdamage -lXcomposite -lXrender -lXrandr -lXext -linput -ludev -levdev
 -include .makerc
 
 csrc := $(wildcard src/*.c) $(wildcard src/**/*.c)

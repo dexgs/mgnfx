@@ -6,6 +6,7 @@
 #include <X11/extensions/composite.h>
 #include <X11/extensions/Xrender.h>
 #include <X11/extensions/Xfixes.h>
+#include <X11/extensions/Xrandr.h> 
 #include <X11/extensions/shape.h>
 
 #include <libinput.h>
@@ -420,7 +421,7 @@ static void init_extension(Display *d, const char *name) {
 
 void draw(
         int width, int height, double scale, int cursor_x, int cursor_y,
-        Pixmap root_background_pixmap, Pixmap dest_pixmap, Pixmap final_pixmap,
+        Pixmap dest_pixmap, Pixmap final_pixmap,
         Picture dest_pic, Picture final_pic,
         XWindowAttributes root_attr, XWindowAttributes dest_attr,
         Window root, Window w, Display *d, GC gc,
@@ -429,6 +430,7 @@ void draw(
     int dummy_int;
 
     // Copy wallpaper
+    Pixmap root_background_pixmap = get_root_background_pixmap(d, root);
     if (root_background_pixmap != None) {
         XCopyArea(d, root_background_pixmap, dest_pixmap, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
     } else {
@@ -476,20 +478,24 @@ void draw(
 
         Picture src_pic = XRenderCreatePicture(d, src_w, src_attr.depth == 24 ? format_24 : format_32, 0, NULL);
         if (src_pic != None) {
+            Pixmap mask = None;
+            Picture mask_pic = None;
             int num_rects = 0;
             XRectangle *rects = XShapeGetRectangles(d, src_w, ShapeBounding, &num_rects, &dummy_int);
-            Pixmap mask = XCreatePixmap(d, root, src_attr.width, src_attr.height, 1);
-            GC mask_gc = XCreateGC(d, mask, 0, NULL);
-            Picture mask_pic = XRenderCreatePicture(d, mask, format_1, 0, NULL);
-            XSetForeground(d, mask_gc, BlackPixel(d, DefaultScreen(d)));
-            XFillRectangle(d, mask, mask_gc, 0, 0, src_attr.width, src_attr.height);
-            XSetForeground(d, mask_gc, WhitePixel(d, DefaultScreen(d)));
-            for (int i = 0; i < num_rects; i++) {
-                XRectangle rect = rects[i];
-                XFillRectangle(d, mask, mask_gc, rect.x, rect.y, rect.width, rect.height);
+            if (num_rects > 1) {
+                mask = XCreatePixmap(d, root, src_attr.width, src_attr.height, 1);
+                mask_pic = XRenderCreatePicture(d, mask, format_1, 0, NULL);
+                GC mask_gc = XCreateGC(d, mask, 0, NULL);
+                XSetForeground(d, mask_gc, BlackPixel(d, DefaultScreen(d)));
+                XFillRectangle(d, mask, mask_gc, 0, 0, src_attr.width, src_attr.height);
+                XSetForeground(d, mask_gc, WhitePixel(d, DefaultScreen(d)));
+                for (int i = 0; i < num_rects; i++) {
+                    XRectangle rect = rects[i];
+                    XFillRectangle(d, mask, mask_gc, rect.x, rect.y, rect.width, rect.height);
+                }
+                if (rects != NULL) XFree(rects);
+                XFreeGC(d, mask_gc);
             }
-            if (rects != NULL) XFree(rects);
-            XFreeGC(d, mask_gc);
 
             int op = src_attr.depth == 32 ? PictOpOver : PictOpSrc;
             XRenderComposite(d, op, src_pic, mask_pic, dest_pic, src_x, src_y, src_x, src_y, dest_x, dest_y, intersection_width, intersection_height);
@@ -605,10 +611,9 @@ int main(int argc, char **argv) {
     if (d == NULL) {
         exit_error("Failed to open X display");
     }
-    Window root = XDefaultRootWindow(d);
+    Window root = DefaultRootWindow(d);
     XWindowAttributes root_attr;
     XGetWindowAttributes(d, root, &root_attr);
-
     int screen = DefaultScreen(d);
 
     // Set error handler to avoid exiting the program for non-fatal X errors
@@ -626,7 +631,8 @@ int main(int argc, char **argv) {
         XFIXES_NAME,
         SHAPENAME,
         COMPOSITE_NAME,
-        RENDER_NAME
+        RENDER_NAME,
+        RANDR_NAME
     };
     int num_extensions =
         sizeof(required_extensions) / sizeof(required_extensions[0]);
@@ -719,11 +725,15 @@ int main(int argc, char **argv) {
     // We want to know about substructure events because these tell us when new
     // windows are created, raised, fullscreened, etc. and let us keep our
     // magnifier window on top when this happens.
-    XSelectInput(d, root, SubstructureNotifyMask);
+    //XSelectInput(d, root, SubstructureNotifyMask | StructureNotifyMask | ResizeRedirectMask);
     int damage_event_base;
     XDamageQueryExtension(d, &damage_event_base, &dummy_int);
     int damage_notify_event = damage_event_base + XDamageNotify;
     Damage damage = XDamageCreate(d, root, XDamageReportRawRectangles);
+    int rr_event_base;
+    XRRQueryExtension(d, &rr_event_base, &dummy_int);
+    int screen_change_notify_event = rr_event_base + RRScreenChangeNotify;
+    XRRSelectInput(d, w, RRScreenChangeNotifyMask);
 
     // XRender setup
 
@@ -749,8 +759,7 @@ int main(int argc, char **argv) {
     Picture final_pic = XRenderCreatePicture(d, final_pixmap, format_24, 0, NULL);
     if (final_pic == None) exit_error("Creating final XRender picture failed");
 
-    Pixmap root_background_pixmap = get_root_background_pixmap(d, root);
-
+    // Setup polling
     struct pollfd pollfds[] = {
         { .fd = d_fd, .events = POLLIN },
         { .fd = li_fd, .events = POLLIN }
@@ -761,7 +770,7 @@ int main(int argc, char **argv) {
     struct pollfd *li_pollfd = &pollfds[1];
 
     // Show the window
-    XMapRaised(d, w);
+    XMapWindow(d, w);
     // Put the screen contents on the window initially
     XCopyArea(d, root, w, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
 
@@ -780,7 +789,7 @@ int main(int argc, char **argv) {
 
     draw(
             width, height, scale, cursor_x, cursor_y,
-            root_background_pixmap, dest_pixmap, final_pixmap,
+            dest_pixmap, final_pixmap,
             dest_pic, final_pic, root_attr, dest_attr, root, w, d, gc,
             format_32, format_24, format_1);
     XFlush(d);
@@ -918,15 +927,19 @@ int main(int argc, char **argv) {
 
         // If there are new events from Xlib
         if (x_pollfd->revents & POLLIN) {
-            bool more = false;
-            while (XPending(d) > 0 || more) {
+            //bool more = false;
+            while (XPending(d) > 0) {
                 XEvent x_ev;
                 XNextEvent(d, &x_ev);
+                //XRRUpdateConfiguration(&x_ev);
                 if (x_ev.type == damage_notify_event) {
                     has_damage = true;
-                    more = ((XDamageNotifyEvent *) &x_ev)->more;
+                    //more = ((XDamageNotifyEvent *) &x_ev)->more;
                     //if (!more) break;
+                } else if (x_ev.type == screen_change_notify_event) {
+                    puts("rr");
                 }
+                //printf("event: %i\n", x_ev.type);
             }
             XDamageSubtract(d, damage, None, None);
         }
@@ -935,40 +948,42 @@ int main(int argc, char **argv) {
             // Redraw the window contents
             draw(
                     width, height, scale, cursor_x, cursor_y,
-                    root_background_pixmap, dest_pixmap, final_pixmap,
+                    dest_pixmap, final_pixmap,
                     dest_pic, final_pic, root_attr, dest_attr, root, w, d, gc,
                     format_32, format_24, format_1);
-            // Wait for completion
+            XSync(d, false);
+            //XFlush(d);
+
+            // Wait for completiona
             XEvent x_ev;
             wait_for_event(d, &x_ev, damage_notify_event);
             wait_for_event(d, &x_ev, NoExpose);
-        }
 
-
-        // Sleep to prevent re-drawing faster than update rate
-        clock_gettime(CLOCK_MONOTONIC_RAW, &time);
-        const long one_second = 1000000000;
-        const long target_nsec = one_second / rate;
-        long delta_nsec =
-            (time.tv_sec - prev_time.tv_sec) * one_second
-            + (time.tv_nsec - prev_time.tv_nsec);
-        if (delta_nsec < target_nsec) {
-            struct timespec duration = {
-                .tv_sec = 0,
-                .tv_nsec = target_nsec - delta_nsec
-            };
-            struct timespec remaining = {
-                .tv_nsec = 1
-            };
-            int success = -1;
-            while (success != 0) {
-                success = nanosleep(&duration, &remaining);
-                duration = remaining;
+            // Sleep to prevent re-drawing faster than update rate
+            clock_gettime(CLOCK_MONOTONIC_RAW, &time);
+            const long one_second = 1000000000;
+            const long target_nsec = one_second / rate;
+            long delta_nsec =
+                (time.tv_sec - prev_time.tv_sec) * one_second
+                + (time.tv_nsec - prev_time.tv_nsec);
+            if (delta_nsec < target_nsec) {
+                struct timespec duration = {
+                    .tv_sec = 0,
+                    .tv_nsec = target_nsec - delta_nsec
+                };
+                struct timespec remaining = {
+                    .tv_nsec = 1
+                };
+                int success = -1;
+                while (success != 0) {
+                    success = nanosleep(&duration, &remaining);
+                    duration = remaining;
+                }
             }
         }
 
+        //XSync(d, true);
         XRaiseWindow(d, w);
-        XSync(d, true);
     }
 
     // Clean up X objects
