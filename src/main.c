@@ -534,67 +534,10 @@ void draw(
     XCopyArea(d, final_pixmap, w, gc, 0, 0, root_attr.width, root_attr.height, 0, 0);
 }
 
-int main(int argc, char **argv) {
-    struct opts opts;
-    get_opts(argc, argv, &opts);
-
-    char *display = getenv("DISPLAY");
-    if (display == NULL) exit_error("Reading the `DISPLAY` environment variable failed");
-
-    // Exit if another instance is already running
-    strcat(pidfile_name, display);
-    char *xdg_runtime_dir_path = getenv("XDG_RUNTIME_DIR");
-    int xdg_runtime_dir = -1;
-    if (xdg_runtime_dir_path != NULL) {
-        pid_t pid = getpid();
-
-        xdg_runtime_dir = open(xdg_runtime_dir_path, O_PATH);
-        exit_errno_if(xdg_runtime_dir, "Opening XDG runtime directory failed");
-        int pidfile = openat(xdg_runtime_dir, pidfile_name, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-        exit_errno_if(pidfile, "Opening pidfile failed");
-
-        exit_errno_if(flock(pidfile, LOCK_EX), "Locking pidfile failed");
-
-        pid_t oldpid;
-        size_t bytes_read = 0;
-        ssize_t r = 1;
-        while (r > 0) {
-            r = read(pidfile, ((char *) &oldpid) + bytes_read, sizeof(oldpid) - bytes_read);
-            exit_errno_if(r, "Reading pidfile failed");
-            bytes_read += r;
-        }
-
-        if (bytes_read == sizeof(oldpid) && pid != oldpid) {
-            char *exe = realpath("/proc/self/exe", NULL);
-            char old_exe_path[256];
-            snprintf(old_exe_path, sizeof(old_exe_path), "/proc/%u/exe", oldpid);
-            old_exe_path[sizeof(old_exe_path) - 1] = 0;
-            char *old_exe = realpath(old_exe_path, NULL);
-
-            if (exe != NULL && old_exe != NULL && strcmp(exe, old_exe) == 0) {
-                exit_error("Another instance is already running.");
-            }
-            free(exe);
-            free(old_exe);
-        }
-
-        exit_errno_if(ftruncate(pidfile, 0), "Truncating pidfile failed");
-        exit_errno_if(lseek(pidfile, 0, SEEK_SET), "Seeking to start of pidfile failed");
-        size_t bytes_written = 0;
-        ssize_t w = 1;
-        while (w > 0) {
-            w = write(pidfile, ((char *) &pid) + bytes_written, sizeof(pid) - bytes_written);
-            exit_errno_if(w, "Writing pidfile failed");
-            bytes_written += w;
-        }
-
-        exit_errno_if(flock(pidfile, LOCK_UN), "Unlocking pidfile failed");
-        exit_errno_if(close(pidfile), "Closing pidfile failed");
-    }
-
+static bool mgnfx(const char *display, const struct opts opts, int *width, int *height, double *scale, int rate) {
     // Setup getting events from libinput
     char *seat = getenv("XDG_SEAT");
-    if (seat == NULL) exit_error("Reading `XDG_SEAT` environment variable failed");
+    if (seat == NULL) exit_error("`XDG_SEAT` environment variable is not set");
     struct udev *udev = udev_new();
     struct libinput *li = libinput_udev_create_context(
             &li_interface, NULL, udev);
@@ -725,7 +668,7 @@ int main(int argc, char **argv) {
     // We want to know about substructure events because these tell us when new
     // windows are created, raised, fullscreened, etc. and let us keep our
     // magnifier window on top when this happens.
-    //XSelectInput(d, root, SubstructureNotifyMask | StructureNotifyMask | ResizeRedirectMask);
+    XSelectInput(d, root, SubstructureNotifyMask | StructureNotifyMask);
     int damage_event_base;
     XDamageQueryExtension(d, &damage_event_base, &dummy_int);
     int damage_notify_event = damage_event_base + XDamageNotify;
@@ -780,26 +723,23 @@ int main(int argc, char **argv) {
     int cursor_x = 0;
     int cursor_y = 0;
     get_cursor_position(d, root, &cursor_x, &cursor_y);
-    int width = opts.width;
-    int height = opts.height;
-    double scale = opts.zoom;
-    int rate = opts.rate;
-
     unsigned int modifiers_held = 0;
 
     draw(
-            width, height, scale, cursor_x, cursor_y,
+            *width, *height, *scale, cursor_x, cursor_y,
             dest_pixmap, final_pixmap,
             dest_pic, final_pic, root_attr, dest_attr, root, w, d, gc,
             format_32, format_24, format_1);
     XFlush(d);
 
-    bool keep_running = true;
     bool input_grabbed = false;
     bool mouse_held = false;
     int click_x;
     int click_y;
-    while (keep_running) {
+
+    bool keep_looping = true;
+    bool should_exit = false;
+    while (keep_looping) {
         poll(pollfds, num_fds, -1);
 
         struct timespec prev_time;
@@ -822,8 +762,8 @@ int main(int argc, char **argv) {
                     case LIBINPUT_EVENT_POINTER_MOTION:
                         if (!input_grabbed) break;
                         if (mouse_held && got_cursor_position) {
-                            width = abs(cursor_x - click_x) * 2;
-                            height = abs(cursor_y - click_y) * 2;
+                            *width = abs(cursor_x - click_x) * 2;
+                            *height = abs(cursor_y - click_y) * 2;
                         }
                         break;
                     case LIBINPUT_EVENT_POINTER_BUTTON:
@@ -884,23 +824,24 @@ int main(int argc, char **argv) {
                                     XUngrabKeyboard(d, CurrentTime);
                                     input_grabbed = false;
                                 } else if (keycode == opts.quit_key) {
-                                    keep_running = false;
+                                    keep_looping = false;
+                                    should_exit = true;
                                 }
                                 if (input_grabbed) {
                                     if (keycode == opts.grow_width_key) {
-                                        width = int_min(width + opts.width_step, root_attr.width);
+                                        *width = int_min(*width + opts.width_step, root_attr.width);
                                     } else if (keycode == opts.shrink_width_key) {
-                                        width = int_max(width - opts.width_step, 1);
+                                        *width = int_max(*width - opts.width_step, 1);
                                     } else if (keycode == opts.grow_height_key) {
-                                        height = int_min(height + opts.height_step, root_attr.height);
+                                        *height = int_min(*height + opts.height_step, root_attr.height);
                                     } else if (keycode == opts.shrink_height_key) {
-                                        height = int_max(height - opts.height_step, 1);
+                                        *height = int_max(*height - opts.height_step, 1);
                                     } else if (keycode == opts.zoom_in_key) {
-                                        scale += opts.zoom_step;
-                                        if (scale > MAX_SCALE) scale = MAX_SCALE;
+                                        *scale += opts.zoom_step;
+                                        if (*scale > MAX_SCALE) *scale = MAX_SCALE;
                                     } else if (keycode == opts.zoom_out_key) {
-                                        scale -= opts.zoom_step;
-                                        if (scale < MIN_SCALE) scale = MIN_SCALE;
+                                        *scale -= opts.zoom_step;
+                                        if (*scale < MIN_SCALE) *scale = MIN_SCALE;
                                     }
                                 }
                                 break;
@@ -911,11 +852,11 @@ int main(int argc, char **argv) {
                             struct libinput_event_pointer *li_ev_axis =
                                 libinput_event_get_pointer_event(li_ev);
                             double scroll = libinput_event_pointer_get_axis_value(li_ev_axis, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
-                            scale -= scroll * opts.zoom_scale;
-                            if (scale < MIN_SCALE) {
-                                scale = MIN_SCALE;
-                            } else if (scale > MAX_SCALE) {
-                                scale = MAX_SCALE;
+                            *scale -= scroll * opts.zoom_scale;
+                            if (*scale < MIN_SCALE) {
+                                *scale = MIN_SCALE;
+                            } else if (*scale > MAX_SCALE) {
+                                *scale = MAX_SCALE;
                             }
                         }
                         break;
@@ -926,18 +867,20 @@ int main(int argc, char **argv) {
         }
 
         // If there are new events from Xlib
-        if (x_pollfd->revents & POLLIN) {
+        int num_pending = XPending(d);
+        if (x_pollfd->revents & POLLIN && num_pending > 0) {
             //bool more = false;
-            while (XPending(d) > 0) {
+            //while (XPending(d) > 0) {
+            for (int i = 0; i < num_pending; i++) {
                 XEvent x_ev;
                 XNextEvent(d, &x_ev);
-                //XRRUpdateConfiguration(&x_ev);
+                XRRUpdateConfiguration(&x_ev);
                 if (x_ev.type == damage_notify_event) {
                     has_damage = true;
                     //more = ((XDamageNotifyEvent *) &x_ev)->more;
                     //if (!more) break;
                 } else if (x_ev.type == screen_change_notify_event) {
-                    puts("rr");
+                    keep_looping = false;
                 }
                 //printf("event: %i\n", x_ev.type);
             }
@@ -947,11 +890,11 @@ int main(int argc, char **argv) {
         if (has_input || has_damage) {
             // Redraw the window contents
             draw(
-                    width, height, scale, cursor_x, cursor_y,
+                    *width, *height, *scale, cursor_x, cursor_y,
                     dest_pixmap, final_pixmap,
                     dest_pic, final_pic, root_attr, dest_attr, root, w, d, gc,
                     format_32, format_24, format_1);
-            XSync(d, false);
+            //XSync(d, false);
             //XFlush(d);
 
             // Wait for completiona
@@ -987,6 +930,8 @@ int main(int argc, char **argv) {
     }
 
     // Clean up X objects
+    XUngrabPointer(d, CurrentTime);
+    XUngrabKeyboard(d, CurrentTime);
     /*
     XFreePixmap(d, dest_pixmap);
     XRenderFreePicture(d, dest_pic);
@@ -1000,6 +945,76 @@ int main(int argc, char **argv) {
     // Clean up libinput
     libinput_unref(li);
     udev_unref(udev);
+
+    return should_exit;
+}
+
+int main(int argc, char **argv) {
+    struct opts opts;
+    get_opts(argc, argv, &opts);
+
+    char *display = getenv("DISPLAY");
+    if (display == NULL) exit_error("`DISPLAY` environment variable is not set");
+
+    // Exit if another instance is already running
+    strcat(pidfile_name, display);
+    char *xdg_runtime_dir_path = getenv("XDG_RUNTIME_DIR");
+    int xdg_runtime_dir = -1;
+    if (xdg_runtime_dir_path != NULL) {
+        pid_t pid = getpid();
+
+        xdg_runtime_dir = open(xdg_runtime_dir_path, O_PATH);
+        exit_errno_if(xdg_runtime_dir, "Opening XDG runtime directory failed");
+        int pidfile = openat(xdg_runtime_dir, pidfile_name, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+        exit_errno_if(pidfile, "Opening pidfile failed");
+
+        exit_errno_if(flock(pidfile, LOCK_EX), "Locking pidfile failed");
+
+        pid_t oldpid;
+        size_t bytes_read = 0;
+        ssize_t r = 1;
+        while (r > 0) {
+            r = read(pidfile, ((char *) &oldpid) + bytes_read, sizeof(oldpid) - bytes_read);
+            exit_errno_if(r, "Reading pidfile failed");
+            bytes_read += r;
+        }
+
+        if (bytes_read == sizeof(oldpid) && pid != oldpid) {
+            char *exe = realpath("/proc/self/exe", NULL);
+            char old_exe_path[256];
+            snprintf(old_exe_path, sizeof(old_exe_path), "/proc/%u/exe", oldpid);
+            old_exe_path[sizeof(old_exe_path) - 1] = 0;
+            char *old_exe = realpath(old_exe_path, NULL);
+
+            if (exe != NULL && old_exe != NULL && strcmp(exe, old_exe) == 0) {
+                exit_error("Another instance is already running.");
+            }
+            free(exe);
+            free(old_exe);
+        }
+
+        exit_errno_if(ftruncate(pidfile, 0), "Truncating pidfile failed");
+        exit_errno_if(lseek(pidfile, 0, SEEK_SET), "Seeking to start of pidfile failed");
+        size_t bytes_written = 0;
+        ssize_t w = 1;
+        while (w > 0) {
+            w = write(pidfile, ((char *) &pid) + bytes_written, sizeof(pid) - bytes_written);
+            exit_errno_if(w, "Writing pidfile failed");
+            bytes_written += w;
+        }
+
+        exit_errno_if(flock(pidfile, LOCK_UN), "Unlocking pidfile failed");
+        exit_errno_if(close(pidfile), "Closing pidfile failed");
+    }
+
+    // Main loop
+    int width = opts.width;
+    int height = opts.height;
+    double scale = opts.zoom;
+    bool should_exit = false;
+    while (!should_exit) {
+        should_exit = mgnfx(display, opts, &width, &height, &scale, opts.rate);
+    }
 
     // Remove pidfile, if it was created
     if (xdg_runtime_dir != -1) {
