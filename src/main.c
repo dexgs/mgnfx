@@ -867,11 +867,11 @@ static bool mgnfx(const char *display, const struct opts opts, int *width, int *
         }
 
         // If there are new events from Xlib
-        int num_pending = XPending(d);
-        if (x_pollfd->revents & POLLIN && num_pending > 0) {
+        int num_events = XQLength(d);
+        if (x_pollfd->revents & POLLIN && num_events > 0) {
             //bool more = false;
             //while (XPending(d) > 0) {
-            for (int i = 0; i < num_pending; i++) {
+            for (int i = 0; i < num_events; i++) {
                 XEvent x_ev;
                 XNextEvent(d, &x_ev);
                 XRRUpdateConfiguration(&x_ev);
