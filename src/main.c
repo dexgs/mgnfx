@@ -559,6 +559,23 @@ static bool mgnfx(const char *display, const struct opts opts, int *width, int *
     XGetWindowAttributes(d, root, &root_attr);
     int screen = DefaultScreen(d);
 
+    // If the configured update rate is `-1`, set the rate to the refresh rate
+    // of the primary monitor
+    if (rate == -1) {
+        XRRScreenResources *res = XRRGetScreenResourcesCurrent(d, root);
+        RROutput primary_output = XRRGetOutputPrimary(d, root);
+        XRROutputInfo *primary_output_info = XRRGetOutputInfo(d, res, primary_output);
+
+        XRRModeInfo m = res->modes[primary_output_info->nmode];
+        // Refresh rate calculation shamelessly stolen from xrandr
+        if (m.hTotal && m.vTotal) {
+            rate = ((double) m.dotClock) / (m.hTotal * m.vTotal) + 0.5;
+        }
+
+        XFree(primary_output_info);
+        XFree(res);
+    }
+
     // Set error handler to avoid exiting the program for non-fatal X errors
     XSetErrorHandler(xerror_handler);
 
